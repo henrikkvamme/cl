@@ -218,59 +218,48 @@ fn fetch_issue(api_key: &str, identifier: &str) -> Result<IssueData, String> {
 }
 
 fn build_issue_prompt(issue: &Value, identifier: &str, branch_name: &str) -> String {
-    let mut p = format!("Work on Linear issue {identifier}:\n\n");
-    p.push_str(&format!("Checkout on this branch {branch_name}\n\n"));
+    let mut p = format!("# Linear Issue {identifier}\n\n");
 
-    // Open issue tag
-    p.push_str(&format!("<issue identifier=\"{identifier}\">\n"));
-
-    // Title
     let title = issue["title"].as_str().unwrap_or("");
-    p.push_str(&format!("<title>{title}</title>\n"));
+    p.push_str(&format!("**Title:** {title}\n\n"));
+
+    p.push_str(&format!("**Branch:** `{branch_name}`\n\n"));
+
+    // Metadata
+    let mut meta = Vec::new();
+    if let Some(team) = issue["team"]["name"].as_str() {
+        meta.push(format!("**Team:** {team}"));
+    }
+    if let Some(state) = issue["state"]["name"].as_str() {
+        meta.push(format!("**Status:** {state}"));
+    }
+    if let Some(pri) = issue["priorityLabel"].as_str() {
+        meta.push(format!("**Priority:** {pri}"));
+    }
+    if let Some(due) = issue["dueDate"].as_str() {
+        meta.push(format!("**Due:** {due}"));
+    }
+    if let Some(est) = issue["estimate"].as_f64() {
+        meta.push(format!("**Estimate:** {est}"));
+    }
+    if let Some(name) = issue["assignee"]["name"].as_str() {
+        meta.push(format!("**Assignee:** {name}"));
+    }
+    if let Some(labels) = issue["labels"]["nodes"].as_array() {
+        let names: Vec<&str> = labels.iter().filter_map(|l| l["name"].as_str()).collect();
+        if !names.is_empty() {
+            meta.push(format!("**Labels:** {}", names.join(", ")));
+        }
+    }
+    if !meta.is_empty() {
+        p.push_str(&meta.join(" | "));
+        p.push_str("\n\n");
+    }
 
     // Description
     let desc = issue["description"].as_str().unwrap_or("");
     if !desc.is_empty() {
-        p.push_str(&format!("<description>{desc}</description>\n"));
-    }
-
-    // Team
-    if let Some(team) = issue["team"]["name"].as_str() {
-        p.push_str(&format!("<team name=\"{team}\"/>\n"));
-    }
-
-    // State
-    if let Some(state) = issue["state"]["name"].as_str() {
-        p.push_str(&format!("<state>{state}</state>\n"));
-    }
-
-    // Priority
-    if let Some(pri) = issue["priorityLabel"].as_str() {
-        p.push_str(&format!("<priority>{pri}</priority>\n"));
-    }
-
-    // Due date
-    if let Some(due) = issue["dueDate"].as_str() {
-        p.push_str(&format!("<due-date>{due}</due-date>\n"));
-    }
-
-    // Estimate
-    if let Some(est) = issue["estimate"].as_f64() {
-        p.push_str(&format!("<estimate>{est}</estimate>\n"));
-    }
-
-    // Labels
-    if let Some(labels) = issue["labels"]["nodes"].as_array() {
-        for label in labels {
-            if let Some(name) = label["name"].as_str() {
-                p.push_str(&format!("<label>{name}</label>\n"));
-            }
-        }
-    }
-
-    // Assignee
-    if let Some(name) = issue["assignee"]["name"].as_str() {
-        p.push_str(&format!("<assignee>{name}</assignee>\n"));
+        p.push_str(&format!("## Description\n\n{desc}\n\n"));
     }
 
     // Parent issue
@@ -278,7 +267,7 @@ fn build_issue_prompt(issue: &Value, identifier: &str, branch_name: &str) -> Str
         issue["parent"]["identifier"].as_str(),
         issue["parent"]["title"].as_str(),
     ) {
-        p.push_str(&format!("<parent identifier=\"{pid}\">{ptitle}</parent>\n"));
+        p.push_str(&format!("## Parent Issue\n\n- **{pid}**: {ptitle}\n\n"));
     }
 
     // Sub-issues
@@ -286,16 +275,14 @@ fn build_issue_prompt(issue: &Value, identifier: &str, branch_name: &str) -> Str
         .as_array()
         .filter(|a| !a.is_empty())
     {
-        p.push_str("<sub-issues>\n");
+        p.push_str("## Sub-issues\n\n");
         for child in children {
             let ci = child["identifier"].as_str().unwrap_or("?");
             let ct = child["title"].as_str().unwrap_or("");
             let cs = child["state"]["name"].as_str().unwrap_or("");
-            p.push_str(&format!(
-                "  <sub-issue identifier=\"{ci}\" state=\"{cs}\">{ct}</sub-issue>\n"
-            ));
+            p.push_str(&format!("- **{ci}** [{cs}]: {ct}\n"));
         }
-        p.push_str("</sub-issues>\n");
+        p.push('\n');
     }
 
     // Relations
@@ -303,16 +290,14 @@ fn build_issue_prompt(issue: &Value, identifier: &str, branch_name: &str) -> Str
         .as_array()
         .filter(|a| !a.is_empty())
     {
-        p.push_str("<relations>\n");
+        p.push_str("## Related Issues\n\n");
         for rel in relations {
             let rtype = rel["type"].as_str().unwrap_or("related");
             let ri = rel["relatedIssue"]["identifier"].as_str().unwrap_or("?");
             let rt = rel["relatedIssue"]["title"].as_str().unwrap_or("");
-            p.push_str(&format!(
-                "  <relation type=\"{rtype}\" identifier=\"{ri}\">{rt}</relation>\n"
-            ));
+            p.push_str(&format!("- **{ri}** ({rtype}): {rt}\n"));
         }
-        p.push_str("</relations>\n");
+        p.push('\n');
     }
 
     // Attachments
@@ -320,13 +305,13 @@ fn build_issue_prompt(issue: &Value, identifier: &str, branch_name: &str) -> Str
         .as_array()
         .filter(|a| !a.is_empty())
     {
-        p.push_str("<attachments>\n");
+        p.push_str("## Attachments\n\n");
         for att in attachments {
             let at = att["title"].as_str().unwrap_or("Untitled");
             let au = att["url"].as_str().unwrap_or("");
-            p.push_str(&format!("  <attachment title=\"{at}\" url=\"{au}\"/>\n"));
+            p.push_str(&format!("- [{at}]({au})\n"));
         }
-        p.push_str("</attachments>\n");
+        p.push('\n');
     }
 
     // Comments
@@ -334,19 +319,15 @@ fn build_issue_prompt(issue: &Value, identifier: &str, branch_name: &str) -> Str
         .as_array()
         .filter(|a| !a.is_empty())
     {
-        p.push_str("<comments>\n");
+        p.push_str("## Comments\n\n");
         for comment in comments {
             let user = comment["user"]["name"].as_str().unwrap_or("Unknown");
             let date = comment["createdAt"].as_str().unwrap_or("");
             let body = comment["body"].as_str().unwrap_or("");
-            p.push_str(&format!(
-                "  <comment by=\"{user}\" date=\"{date}\">{body}</comment>\n"
-            ));
+            p.push_str(&format!("**{user}** ({date}):\n{body}\n\n"));
         }
-        p.push_str("</comments>\n");
     }
 
-    p.push_str("</issue>");
     p
 }
 
@@ -472,6 +453,13 @@ fn build_prompt(issue: &IssueData, worktree: bool, chrome: bool) -> String {
 
     prompt.push_str("\n\n---\n\n");
 
+    if worktree || !issue.branch_name.is_empty() {
+        prompt.push_str(&format!(
+            "You are on working branch `{}`.\n\n",
+            issue.branch_name
+        ));
+    }
+
     if worktree {
         prompt.push_str(
             "You are in a git worktree. As a first step, symlink .env and .env.local \
@@ -504,7 +492,9 @@ fn build_prompt(issue: &IssueData, worktree: bool, chrome: bool) -> String {
             "\nFor checking: if there are any visual changes, run the application in \
              debug/dev mode and verify that the feature works correctly in the browser.\n\
              When creating the PR, if there are visual changes, take a screenrecording using the \
-             Chrome gif_creator tool and include it in the PR as a comment. Upload using the git_shot skill.",
+             Chrome gif_creator tool and include it in the PR as a comment. Upload using the git_shot skill.\n\
+             IMPORTANT: If the project uses bun, use `bunx gitshot ...`, otherwise it will not work.
+             \n",
         );
     }
 
