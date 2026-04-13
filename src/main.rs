@@ -28,6 +28,10 @@ struct Cli {
     /// Enable Chrome integration
     #[arg(short = 'c')]
     chrome: bool,
+
+    /// Base branch for rebasing (default: auto-detect)
+    #[arg(long)]
+    base: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -412,6 +416,82 @@ fn parse_identifier(link: &str) -> Result<String, String> {
 
 // --- Git ---
 
+fn current_branch() -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    if !output.status.success() {
+        return Err("Failed to get current branch".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn default_branch() -> String {
+    Command::new("git")
+        .args(["config", "init.defaultBranch"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .unwrap_or_else(|| "main".to_string())
+}
+
+fn is_issue_branch(branch: &str) -> bool {
+    // Match TEAM-123 pattern anywhere in branch name (e.g. "user/KL-35-some-slug")
+    let bytes = branch.as_bytes();
+    for i in 0..bytes.len() {
+        // Must start at beginning or after a non-letter char
+        if i > 0 && bytes[i - 1].is_ascii_alphabetic() {
+            continue;
+        }
+        // Find uppercase letters
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_uppercase() {
+            j += 1;
+        }
+        if j == i || j >= bytes.len() || bytes[j] != b'-' {
+            continue;
+        }
+        j += 1; // skip dash
+        let digit_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > digit_start {
+            return true;
+        }
+    }
+    false
+}
+
+fn resolve_base_branch(explicit: Option<&str>) -> Result<String, String> {
+    if let Some(base) = explicit {
+        return Ok(base.to_string());
+    }
+
+    let current = current_branch()?;
+    let default = default_branch();
+
+    // On default branch → use it
+    if current == default {
+        return Ok(default);
+    }
+
+    // On an issue branch → use default
+    if is_issue_branch(&current) {
+        return Ok(default);
+    }
+
+    // On some other branch (e.g. "rebus", "v2") → use it as base
+    // (The interactive picker for this will be added in Phase 5 with inquire)
+    eprintln!("Using current branch '{current}' as base (use --base to override)");
+    Ok(current)
+}
+
 fn ensure_clean_tree() -> Result<(), String> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
@@ -448,7 +528,7 @@ fn ensure_chrome_running() {
 
 // --- Prompt ---
 
-fn build_prompt(issue: &IssueData, worktree: bool, chrome: bool) -> String {
+fn build_prompt(issue: &IssueData, worktree: bool, chrome: bool, base_branch: &str) -> String {
     let mut prompt = issue.prompt.clone();
 
     prompt.push_str("\n\n---\n\n");
@@ -460,21 +540,14 @@ fn build_prompt(issue: &IssueData, worktree: bool, chrome: bool) -> String {
         ));
     }
 
-    if worktree {
-        prompt.push_str(
-            "You are in a git worktree. As a first step, symlink .env and .env.local \
-             from the main repository root into this worktree directory if they exist.\n\n",
-        );
-    }
-
-    prompt.push_str(
+    prompt.push_str(&format!(
         "Follow this workflow:\n\
          1. Read the issue description and plan your implementation approach.\n\
          2. Implement the changes.\n\
          3. Run any relevant linting and formatting tools if necessary.\n\
-         4. Run `git fetch origin main && git rebase origin/main` to make sure we are up-to-date before pushing.\n\
+         4. Run `git fetch origin {base_branch} && git rebase origin/{base_branch}` to make sure we are up-to-date before pushing.\n\
          5. Create a pull request and assign it to me.\n",
-    );
+    ));
 
     if let Some(ref review_id) = issue.review_state_id {
         prompt.push_str(&format!(
@@ -542,12 +615,16 @@ fn main() {
             });
             // Default: worktree. -b: branch (no worktree). --raw: neither.
             let worktree = !cli.branch && !cli.raw;
-            run_start(&issue_link, cli.branch, worktree, cli.chrome);
+            let base_branch = resolve_base_branch(cli.base.as_deref()).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+            run_start(&issue_link, cli.branch, worktree, cli.chrome, &base_branch);
         }
     }
 }
 
-fn run_start(issue_link: &str, branch: bool, worktree: bool, chrome: bool) {
+fn run_start(issue_link: &str, branch: bool, worktree: bool, chrome: bool, base_branch: &str) {
     let identifier = parse_identifier(issue_link).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         process::exit(1);
@@ -581,6 +658,6 @@ fn run_start(issue_link: &str, branch: bool, worktree: bool, chrome: bool) {
         ensure_chrome_running();
     }
 
-    let prompt = build_prompt(&issue, worktree, chrome);
+    let prompt = build_prompt(&issue, worktree, chrome, base_branch);
     exec_claude(&issue, &prompt, worktree, chrome);
 }
