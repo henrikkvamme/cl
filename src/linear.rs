@@ -317,12 +317,35 @@ pub fn parse_team_and_number(identifier: &str) -> Result<(String, f64), String> 
     Ok((team_key, number))
 }
 
-pub fn parse_identifier(link: &str) -> Result<String, String> {
+/// Resolve an issue input to a TEAM-123 identifier.
+/// Accepts: full Linear URL, "KL-35", or bare "35" (requires team from config).
+pub fn resolve_identifier(input: &str, team: Option<&str>) -> Result<String, String> {
+    let input = input.trim();
+
+    // Case 1: bare number → prepend team
+    if input.chars().all(|c| c.is_ascii_digit()) {
+        let team = team.ok_or(
+            "Bare issue number requires a team. Set [workspace] team in .cl/config.toml",
+        )?;
+        return Ok(format!("{}-{}", team.to_uppercase(), input));
+    }
+
+    // Case 2: TEAM-123 format
+    let upper = input.to_uppercase();
+    if parse_team_and_number(&upper).is_ok() {
+        return Ok(upper);
+    }
+
+    // Case 3: full URL
+    parse_identifier_from_url(input)
+}
+
+fn parse_identifier_from_url(link: &str) -> Result<String, String> {
     let parts: Vec<&str> = link.trim_end_matches('/').split('/').collect();
     let idx = parts
         .iter()
         .position(|&p| p == "issue")
-        .ok_or("URL does not contain 'issue' segment")?;
+        .ok_or("Invalid input: expected a Linear URL, issue identifier (KL-35), or number (35)")?;
     let ident = parts
         .get(idx + 1)
         .ok_or("No identifier found after 'issue' in URL")?;

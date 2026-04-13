@@ -93,7 +93,7 @@ fn run_start(
     base_branch: &str,
     cfg: &config::ClConfig,
 ) {
-    let identifier = linear::parse_identifier(issue_link).unwrap_or_else(|e| {
+    let identifier = linear::resolve_identifier(issue_link, cfg.team()).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         process::exit(1);
     });
