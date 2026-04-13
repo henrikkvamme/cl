@@ -41,14 +41,20 @@ enum Commands {
         /// Linear API key
         api_key: String,
     },
+    /// Print current merged configuration
+    Config,
 }
 
 fn main() {
     let cli = Cli::parse();
+    let cfg = config::load_config();
 
     match cli.command {
         Some(Commands::Login { api_key }) => {
             config::save_token(&api_key);
+        }
+        Some(Commands::Config) => {
+            config::print_config(&cfg);
         }
         None => {
             let issue_link = cli.issue_link.unwrap_or_else(|| {
@@ -56,18 +62,37 @@ fn main() {
                 eprintln!("       cl login <api-key>");
                 process::exit(1);
             });
-            let worktree = !cli.branch && !cli.raw;
+
+            // CLI flags override config
+            let mode = if cli.branch {
+                "branch"
+            } else if cli.raw {
+                "raw"
+            } else {
+                cfg.mode()
+            };
+            let worktree = mode == "worktree";
+            let branch = mode == "branch";
+            let chrome = cli.chrome || cfg.chrome();
+
             let base_branch =
                 git::resolve_base_branch(cli.base.as_deref()).unwrap_or_else(|e| {
                     eprintln!("Error: {e}");
                     process::exit(1);
                 });
-            run_start(&issue_link, cli.branch, worktree, cli.chrome, &base_branch);
+            run_start(&issue_link, branch, worktree, chrome, &base_branch, &cfg);
         }
     }
 }
 
-fn run_start(issue_link: &str, branch: bool, worktree: bool, chrome: bool, base_branch: &str) {
+fn run_start(
+    issue_link: &str,
+    branch: bool,
+    worktree: bool,
+    chrome: bool,
+    base_branch: &str,
+    cfg: &config::ClConfig,
+) {
     let identifier = linear::parse_identifier(issue_link).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         process::exit(1);
@@ -102,5 +127,5 @@ fn run_start(issue_link: &str, branch: bool, worktree: bool, chrome: bool, base_
     }
 
     let prompt = prompt::build_prompt(&issue, worktree, chrome, base_branch);
-    claude::exec_claude(&issue, &prompt, worktree, chrome);
+    claude::exec_claude(&issue, &prompt, worktree, chrome, cfg);
 }

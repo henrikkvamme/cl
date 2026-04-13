@@ -1,6 +1,7 @@
 use std::os::unix::process::CommandExt;
 use std::process::{self, Command};
 
+use crate::config::ClConfig;
 use crate::linear::IssueData;
 
 pub fn ensure_chrome_running() {
@@ -13,12 +14,20 @@ pub fn ensure_chrome_running() {
     }
 }
 
-pub fn exec_claude(issue: &IssueData, prompt: &str, worktree: bool, chrome: bool) -> ! {
+pub fn exec_claude(
+    issue: &IssueData,
+    prompt: &str,
+    worktree: bool,
+    chrome: bool,
+    cfg: &ClConfig,
+) -> ! {
     let mut cmd = Command::new("claude");
 
-    cmd.arg("--allow-dangerously-skip-permissions");
+    if cfg.skip_permissions() {
+        cmd.arg("--allow-dangerously-skip-permissions");
+    }
     cmd.args(["--name", &issue.identifier]);
-    cmd.args(["--permission-mode", "plan"]);
+    cmd.args(["--permission-mode", cfg.permission_mode()]);
 
     if chrome {
         cmd.arg("--chrome");
