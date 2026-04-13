@@ -1,4 +1,5 @@
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{self, Command};
 
 use crate::config::ClConfig;
@@ -17,7 +18,7 @@ pub fn ensure_chrome_running() {
 pub fn exec_claude(
     issue: &IssueData,
     prompt: &str,
-    worktree: bool,
+    worktree_path: Option<&Path>,
     chrome: bool,
     cfg: &ClConfig,
 ) -> ! {
@@ -33,11 +34,27 @@ pub fn exec_claude(
         cmd.arg("--chrome");
     }
 
-    if worktree {
-        cmd.args(["--worktree", &issue.branch_name]);
+    if let Some(path) = worktree_path {
+        cmd.current_dir(path);
     }
 
     cmd.arg(prompt);
+
+    let err = cmd.exec();
+    eprintln!("Failed to exec claude: {err}");
+    process::exit(1);
+}
+
+pub fn exec_claude_resume(name: &str, worktree_path: &Path, cfg: &ClConfig) -> ! {
+    let mut cmd = Command::new("claude");
+
+    if cfg.skip_permissions() {
+        cmd.arg("--allow-dangerously-skip-permissions");
+    }
+    cmd.args(["--name", name]);
+    cmd.args(["--permission-mode", cfg.permission_mode()]);
+    cmd.arg("--continue");
+    cmd.current_dir(worktree_path);
 
     let err = cmd.exec();
     eprintln!("Failed to exec claude: {err}");

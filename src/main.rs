@@ -14,8 +14,8 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Linear issue URL (e.g. https://linear.app/org/issue/KL-35/slug)
-    issue_link: Option<String>,
+    /// Linear issue: URL, identifier (KL-35), or number (35)
+    issue: Option<String>,
 
     /// Create a new git branch instead of a worktree
     #[arg(short = 'b')]
@@ -57,8 +57,8 @@ fn main() {
             config::print_config(&cfg);
         }
         None => {
-            let issue_link = cli.issue_link.unwrap_or_else(|| {
-                eprintln!("Usage: cl <issue-link> [-b -c] [--raw]");
+            let issue = cli.issue.unwrap_or_else(|| {
+                eprintln!("Usage: cl <issue> [-b -c] [--raw]");
                 eprintln!("       cl login <api-key>");
                 process::exit(1);
             });
@@ -80,23 +80,24 @@ fn main() {
                     eprintln!("Error: {e}");
                     process::exit(1);
                 });
-            run_start(&issue_link, branch, worktree, chrome, &base_branch, &cfg);
+            run_start(&issue, branch, worktree, chrome, &base_branch, &cfg);
         }
     }
 }
 
 fn run_start(
-    issue_link: &str,
+    issue_input: &str,
     branch: bool,
     worktree: bool,
     chrome: bool,
     base_branch: &str,
     cfg: &config::ClConfig,
 ) {
-    let identifier = linear::resolve_identifier(issue_link, cfg.team()).unwrap_or_else(|e| {
-        eprintln!("Error: {e}");
-        process::exit(1);
-    });
+    let identifier =
+        linear::resolve_identifier(issue_input, cfg.team()).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        });
 
     let api_key = config::load_token();
 
@@ -110,7 +111,14 @@ fn run_start(
 
     linear::update_issue(&api_key, &issue);
 
-    if branch {
+    let worktree_path = if worktree {
+        let path = git::create_worktree(&issue.branch_name).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        });
+        eprintln!("Worktree: {}", path.display());
+        Some(path)
+    } else if branch {
         git::ensure_clean_tree().unwrap_or_else(|e| {
             eprintln!("Error: {e}");
             process::exit(1);
@@ -120,12 +128,21 @@ fn run_start(
             process::exit(1);
         });
         eprintln!("Created branch: {}", issue.branch_name);
-    }
+        None
+    } else {
+        None
+    };
 
     if chrome {
         claude::ensure_chrome_running();
     }
 
     let prompt = prompt::build_prompt(&issue, worktree, chrome, base_branch);
-    claude::exec_claude(&issue, &prompt, worktree, chrome, cfg);
+    claude::exec_claude(
+        &issue,
+        &prompt,
+        worktree_path.as_deref(),
+        chrome,
+        cfg,
+    );
 }
