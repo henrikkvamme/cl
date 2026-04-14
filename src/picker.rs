@@ -5,32 +5,52 @@ use inquire::Select;
 use crate::git::{self, WorktreeInfo};
 use crate::linear::IssueSummary;
 
-/// A single item in the unified picker
 pub enum PickerItem {
     Session {
         worktree: WorktreeInfo,
         title: String,
+        first_in_section: bool,
     },
-    Issue(IssueSummary),
-    Separator(String),
+    Issue {
+        issue: IssueSummary,
+        first_in_section: bool,
+    },
 }
 
-/// What the user selected
 pub enum PickerResult {
     ResumeSession(WorktreeInfo),
-    StartIssue(String), // identifier
+    StartIssue(String),
 }
 
 impl fmt::Display for PickerItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PickerItem::Session { worktree, title } => {
+            PickerItem::Session {
+                worktree,
+                title,
+                first_in_section,
+            } => {
+                if *first_in_section {
+                    write!(f, "── Active Sessions ──\n  ")?;
+                }
                 let id = worktree.display_name();
                 let ago = git::time_ago(worktree.last_activity);
                 write!(f, "{id}  {title}  ({ago})")
             }
-            PickerItem::Issue(issue) => write!(f, "{issue}"),
-            PickerItem::Separator(label) => write!(f, "── {label} ──"),
+            PickerItem::Issue {
+                issue,
+                first_in_section,
+            } => {
+                if *first_in_section {
+                    let section = if issue.assignee_id.is_some() {
+                        "My Issues"
+                    } else {
+                        "Team Issues"
+                    };
+                    write!(f, "── {section} ──\n  ")?;
+                }
+                write!(f, "{issue}")
+            }
         }
     }
 }
@@ -38,22 +58,16 @@ impl fmt::Display for PickerItem {
 impl PickerItem {
     fn searchable_text(&self) -> String {
         match self {
-            PickerItem::Session { worktree, title } => {
-                format!(
-                    "{} {}",
-                    worktree.display_name(),
-                    title,
-                )
+            PickerItem::Session { worktree, title, .. } => {
+                format!("{} {}", worktree.display_name(), title)
             }
-            PickerItem::Issue(issue) => {
+            PickerItem::Issue { issue, .. } => {
                 format!("{} {} {}", issue.identifier, issue.title, issue.priority_label)
             }
-            PickerItem::Separator(_) => String::new(),
         }
     }
 }
 
-/// Build and show the unified picker. Returns what the user selected.
 pub fn show_unified_picker(
     worktrees: Vec<WorktreeInfo>,
     issues: Vec<IssueSummary>,
@@ -62,73 +76,56 @@ pub fn show_unified_picker(
 ) -> Result<PickerResult, String> {
     let mut items: Vec<PickerItem> = Vec::new();
 
-    // Collect identifiers of active sessions to dedup from issue list
     let active_ids: Vec<String> = worktrees
         .iter()
         .filter_map(|w| w.identifier.clone())
         .collect();
 
-    // Section 1: Active Sessions
-    if !worktrees.is_empty() {
-        items.push(PickerItem::Separator("Active Sessions".to_string()));
-        for wt in worktrees {
-            let title = wt
-                .identifier
-                .as_ref()
-                .and_then(|id| session_titles.get(id))
-                .cloned()
-                .unwrap_or_default();
-            items.push(PickerItem::Session {
-                worktree: wt,
-                title,
-            });
-        }
+    for (i, wt) in worktrees.into_iter().enumerate() {
+        let title = wt
+            .identifier
+            .as_ref()
+            .and_then(|id| session_titles.get(id))
+            .cloned()
+            .unwrap_or_default();
+        items.push(PickerItem::Session {
+            worktree: wt,
+            title,
+            first_in_section: i == 0,
+        });
     }
 
-    // Split issues: mine vs team, excluding active sessions
     let (my_issues, team_issues): (Vec<_>, Vec<_>) = issues
         .into_iter()
         .filter(|i| !active_ids.contains(&i.identifier))
         .partition(|i| i.assignee_id.as_deref() == Some(viewer_id));
 
-    // Section 2: My Issues
-    if !my_issues.is_empty() {
-        items.push(PickerItem::Separator("My Issues".to_string()));
-        for issue in my_issues {
-            items.push(PickerItem::Issue(issue));
-        }
+    for (i, issue) in my_issues.into_iter().enumerate() {
+        items.push(PickerItem::Issue {
+            issue,
+            first_in_section: i == 0,
+        });
     }
 
-    // Section 3: Team Issues
-    if !team_issues.is_empty() {
-        items.push(PickerItem::Separator("Team Issues".to_string()));
-        for issue in team_issues {
-            items.push(PickerItem::Issue(issue));
-        }
+    for (i, issue) in team_issues.into_iter().enumerate() {
+        items.push(PickerItem::Issue {
+            issue,
+            first_in_section: i == 0,
+        });
     }
 
-    let selectable_count = items
-        .iter()
-        .filter(|i| !matches!(i, PickerItem::Separator(_)))
-        .count();
-    if selectable_count == 0 {
+    if items.is_empty() {
         return Err("No issues or sessions found.".into());
     }
 
     let item_count = items.len() as i64;
-    let scorer = |input: &str, item: &PickerItem, _display: &str, idx: usize| -> Option<i64> {
-        // Use (item_count - idx) as score to preserve original insertion order.
-        // inquire sorts by score descending, so first items get the highest score.
+    let scorer = |input: &str, _item: &PickerItem, _display: &str, idx: usize| -> Option<i64> {
         let position_score = item_count - idx as i64;
 
         if input.is_empty() {
             return Some(position_score);
         }
-        // Hide separators when filtering
-        if matches!(item, PickerItem::Separator(_)) {
-            return None;
-        }
-        let haystack = item.searchable_text().to_lowercase();
+        let haystack = _item.searchable_text().to_lowercase();
         let needle = input.to_lowercase();
         if needle.split_whitespace().all(|term| haystack.contains(term)) {
             Some(position_score)
@@ -145,7 +142,6 @@ pub fn show_unified_picker(
 
     match selection {
         PickerItem::Session { worktree, .. } => Ok(PickerResult::ResumeSession(worktree)),
-        PickerItem::Issue(issue) => Ok(PickerResult::StartIssue(issue.identifier)),
-        PickerItem::Separator(_) => Err("Invalid selection".into()),
+        PickerItem::Issue { issue, .. } => Ok(PickerResult::StartIssue(issue.identifier)),
     }
 }
