@@ -126,6 +126,37 @@ fn find_workspace_config() -> Option<PathBuf> {
     }
 }
 
+/// Save team to workspace config (.cl/config.toml in repo root).
+/// Creates the file and directory if they don't exist.
+/// Merges with existing config if present.
+pub fn save_workspace_team(team: &str) {
+    let dir = std::env::current_dir().expect("Could not get current directory");
+
+    // Find git root to place .cl/ there
+    let root = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        .unwrap_or(dir);
+
+    let cl_dir = root.join(".cl");
+    fs::create_dir_all(&cl_dir).ok();
+    let config_path = cl_dir.join("config.toml");
+
+    // Load existing config and merge
+    let mut config = load_config_file(&config_path);
+    let workspace = config.workspace.get_or_insert_with(WorkspaceConfig::default);
+    workspace.team = Some(team.to_uppercase());
+
+    let content = toml::to_string_pretty(&config).unwrap_or_default();
+    fs::write(&config_path, content).unwrap_or_else(|e| {
+        eprintln!("Warning: Could not save config to {}: {e}", config_path.display());
+    });
+    eprintln!("Saved team '{}' to {}", team.to_uppercase(), config_path.display());
+}
+
 pub fn print_config(config: &ClConfig) {
     println!(
         "{}",

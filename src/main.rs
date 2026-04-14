@@ -117,24 +117,22 @@ fn resolve_team(cfg: &config::ClConfig, api_key: &str) -> String {
         process::exit(1);
     }
 
-    if teams.len() == 1 {
+    let key = if teams.len() == 1 {
         let team = &teams[0];
         eprintln!("Using team: {} ({})", team.key, team.name);
-        return team.key.clone();
-    }
-
-    let selected = Select::new("Select team:", teams)
-        .prompt()
-        .unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
-            process::exit(1);
-        });
-
-    eprintln!(
-        "Tip: Set [workspace] team = \"{}\" in .cl/config.toml to skip this prompt.",
+        team.key.clone()
+    } else {
+        let selected = Select::new("Select team:", teams)
+            .prompt()
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
         selected.key
-    );
-    selected.key
+    };
+
+    config::save_workspace_team(&key);
+    key
 }
 
 fn run_picker(

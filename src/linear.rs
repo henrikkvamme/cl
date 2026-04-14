@@ -5,8 +5,10 @@ use serde_json::{Value, json};
 pub struct IssueSummary {
     pub identifier: String,
     pub title: String,
+    pub priority: i64,
     pub priority_label: String,
     pub state_name: String,
+    pub state_type: String,
     pub assignee_id: Option<String>,
 }
 
@@ -382,7 +384,7 @@ pub fn fetch_team_issues(
                     title
                     priority
                     priorityLabel
-                    state { name }
+                    state { name type }
                     assignee { id name }
                 }
             }
@@ -401,18 +403,43 @@ pub fn fetch_team_issues(
         .as_array()
         .ok_or("No issues in response")?;
 
-    let issues = nodes
+    let mut issues: Vec<IssueSummary> = nodes
         .iter()
         .map(|n| IssueSummary {
             identifier: n["identifier"].as_str().unwrap_or("").to_string(),
             title: n["title"].as_str().unwrap_or("").to_string(),
+            priority: n["priority"].as_i64().unwrap_or(0),
             priority_label: n["priorityLabel"].as_str().unwrap_or("").to_string(),
             state_name: n["state"]["name"].as_str().unwrap_or("").to_string(),
+            state_type: n["state"]["type"].as_str().unwrap_or("").to_string(),
             assignee_id: n["assignee"]["id"].as_str().map(String::from),
         })
         .collect();
 
+    sort_issues(&mut issues);
     Ok((issues, viewer_id))
+}
+
+/// Sort issues by: priority (urgent first, no-priority last), then started before backlog, then by identifier.
+fn sort_issues(issues: &mut [IssueSummary]) {
+    issues.sort_by(|a, b| {
+        // Priority: 1=urgent, 2=high, 3=medium, 4=low, 0=no priority
+        // Map 0 to 5 so no-priority sorts last
+        let pa = if a.priority == 0 { 5 } else { a.priority };
+        let pb = if b.priority == 0 { 5 } else { b.priority };
+        pa.cmp(&pb)
+            .then_with(|| state_order(&a.state_type).cmp(&state_order(&b.state_type)))
+            .then_with(|| a.identifier.cmp(&b.identifier))
+    });
+}
+
+fn state_order(state_type: &str) -> u8 {
+    match state_type {
+        "started" => 0,   // In Progress first
+        "unstarted" => 1,  // Todo/Backlog
+        "backlog" => 2,
+        _ => 3,
+    }
 }
 
 /// Batch-fetch issue statuses by identifiers.
@@ -451,8 +478,10 @@ pub fn fetch_issue_statuses(
         .map(|n| IssueSummary {
             identifier: n["identifier"].as_str().unwrap_or("").to_string(),
             title: n["title"].as_str().unwrap_or("").to_string(),
+            priority: n["priority"].as_i64().unwrap_or(0),
             priority_label: n["priorityLabel"].as_str().unwrap_or("").to_string(),
             state_name: n["state"]["name"].as_str().unwrap_or("").to_string(),
+            state_type: n["state"]["type"].as_str().unwrap_or("").to_string(),
             assignee_id: n["assignee"]["id"].as_str().map(String::from),
         })
         .collect())
