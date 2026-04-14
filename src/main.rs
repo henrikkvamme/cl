@@ -215,6 +215,20 @@ fn run_start(
     eprintln!("  {} — {}", issue.identifier, issue.title);
     eprintln!("  Branch: {}", issue.branch_name);
 
+    // Check for existing worktree — resume session if found
+    if worktree {
+        let existing = git::list_worktrees()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|w| w.identifier.as_deref() == Some(&identifier));
+
+        if let Some(wt) = existing {
+            eprintln!("  Resuming existing session...");
+            eprintln!();
+            claude::exec_claude_resume(wt.display_name(), &wt.path, cfg);
+        }
+    }
+
     linear::update_issue(&api_key, &issue);
 
     let worktree_path = if worktree {
