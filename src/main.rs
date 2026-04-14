@@ -2,8 +2,10 @@ mod claude;
 mod config;
 mod git;
 mod linear;
+mod picker;
 mod prompt;
 
+use std::collections::HashMap;
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -57,12 +59,6 @@ fn main() {
             config::print_config(&cfg);
         }
         None => {
-            let issue = cli.issue.unwrap_or_else(|| {
-                eprintln!("Usage: cl <issue> [-b -c] [--raw]");
-                eprintln!("       cl login <api-key>");
-                process::exit(1);
-            });
-
             // CLI flags override config
             let mode = if cli.branch {
                 "branch"
@@ -80,7 +76,75 @@ fn main() {
                     eprintln!("Error: {e}");
                     process::exit(1);
                 });
-            run_start(&issue, branch, worktree, chrome, &base_branch, &cfg);
+
+            match cli.issue {
+                Some(issue) => {
+                    run_start(&issue, branch, worktree, chrome, &base_branch, &cfg);
+                }
+                None => {
+                    run_picker(branch, worktree, chrome, &base_branch, &cfg);
+                }
+            }
+        }
+    }
+}
+
+fn run_picker(
+    branch: bool,
+    worktree: bool,
+    chrome: bool,
+    base_branch: &str,
+    cfg: &config::ClConfig,
+) {
+    let team = cfg.team().unwrap_or_else(|| {
+        eprintln!("Error: No team configured. Set [workspace] team in .cl/config.toml");
+        process::exit(1);
+    });
+
+    let api_key = config::load_token();
+
+    // Fetch worktrees and issues in sequence (both need the API key context)
+    let worktrees = git::list_worktrees().unwrap_or_else(|e| {
+        eprintln!("Warning: Could not list worktrees: {e}");
+        Vec::new()
+    });
+
+    eprintln!("Fetching issues for team {team}...");
+    let (issues, viewer_id) = linear::fetch_team_issues(&api_key, team).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    // Fetch titles for active sessions from Linear
+    let session_ids: Vec<&str> = worktrees
+        .iter()
+        .filter_map(|w| w.identifier.as_deref())
+        .collect();
+    let session_titles: HashMap<String, String> = if !session_ids.is_empty() {
+        linear::fetch_issue_statuses(&api_key, &session_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.identifier, s.title))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let result =
+        picker::show_unified_picker(worktrees, issues, &viewer_id, &session_titles)
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+
+    match result {
+        picker::PickerResult::ResumeSession(wt) => {
+            let name = wt.identifier.as_deref().unwrap_or(&wt.branch);
+            eprintln!("Resuming session in {}...", wt.path.display());
+            claude::exec_claude_resume(name, &wt.path, cfg);
+        }
+        picker::PickerResult::StartIssue(identifier) => {
+            run_start(&identifier, branch, worktree, chrome, base_branch, cfg);
         }
     }
 }

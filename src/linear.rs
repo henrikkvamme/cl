@@ -1,4 +1,27 @@
+use std::fmt;
+
 use serde_json::{Value, json};
+
+pub struct IssueSummary {
+    pub identifier: String,
+    pub title: String,
+    pub priority: i64,
+    pub priority_label: String,
+    pub state_name: String,
+    pub assignee_id: Option<String>,
+    pub assignee_name: Option<String>,
+}
+
+impl fmt::Display for IssueSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pri = if self.priority_label.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", self.priority_label)
+        };
+        write!(f, "{}{}  {}", self.identifier, pri, self.title)
+    }
+}
 
 pub struct IssueData {
     pub id: String,
@@ -301,6 +324,106 @@ pub fn update_issue(api_key: &str, issue: &IssueData) {
         }
         Err(e) => eprintln!("Warning: Failed to update issue: {e}"),
     }
+}
+
+/// Fetch open issues for a team. Returns (issues, viewer_id).
+pub fn fetch_team_issues(
+    api_key: &str,
+    team_key: &str,
+) -> Result<(Vec<IssueSummary>, String), String> {
+    let query = r#"
+        query($teamKey: String!) {
+            issues(
+                filter: {
+                    team: { key: { eq: $teamKey } }
+                    state: { type: { nin: ["completed", "cancelled"] } }
+                }
+                orderBy: updatedAt
+                first: 100
+            ) {
+                nodes {
+                    identifier
+                    title
+                    priority
+                    priorityLabel
+                    state { name }
+                    assignee { id name }
+                }
+            }
+            viewer { id }
+        }
+    "#;
+
+    let data = graphql(api_key, query, json!({ "teamKey": team_key }))?;
+
+    let viewer_id = data["viewer"]["id"]
+        .as_str()
+        .ok_or("Could not get viewer ID")?
+        .to_string();
+
+    let nodes = data["issues"]["nodes"]
+        .as_array()
+        .ok_or("No issues in response")?;
+
+    let issues = nodes
+        .iter()
+        .map(|n| IssueSummary {
+            identifier: n["identifier"].as_str().unwrap_or("").to_string(),
+            title: n["title"].as_str().unwrap_or("").to_string(),
+            priority: n["priority"].as_i64().unwrap_or(4),
+            priority_label: n["priorityLabel"].as_str().unwrap_or("").to_string(),
+            state_name: n["state"]["name"].as_str().unwrap_or("").to_string(),
+            assignee_id: n["assignee"]["id"].as_str().map(String::from),
+            assignee_name: n["assignee"]["name"].as_str().map(String::from),
+        })
+        .collect();
+
+    Ok((issues, viewer_id))
+}
+
+/// Batch-fetch issue statuses by identifiers.
+pub fn fetch_issue_statuses(
+    api_key: &str,
+    identifiers: &[&str],
+) -> Result<Vec<IssueSummary>, String> {
+    if identifiers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let filter_values: Vec<Value> = identifiers.iter().map(|id| json!(id)).collect();
+    let query = r#"
+        query($identifiers: [String!]!) {
+            issues(filter: { identifier: { in: $identifiers } }) {
+                nodes {
+                    identifier
+                    title
+                    priority
+                    priorityLabel
+                    state { name type }
+                    assignee { id name }
+                }
+            }
+        }
+    "#;
+
+    let data = graphql(api_key, query, json!({ "identifiers": filter_values }))?;
+
+    let nodes = data["issues"]["nodes"]
+        .as_array()
+        .ok_or("No issues in response")?;
+
+    Ok(nodes
+        .iter()
+        .map(|n| IssueSummary {
+            identifier: n["identifier"].as_str().unwrap_or("").to_string(),
+            title: n["title"].as_str().unwrap_or("").to_string(),
+            priority: n["priority"].as_i64().unwrap_or(4),
+            priority_label: n["priorityLabel"].as_str().unwrap_or("").to_string(),
+            state_name: n["state"]["name"].as_str().unwrap_or("").to_string(),
+            assignee_id: n["assignee"]["id"].as_str().map(String::from),
+            assignee_name: n["assignee"]["name"].as_str().map(String::from),
+        })
+        .collect())
 }
 
 pub fn parse_team_and_number(identifier: &str) -> Result<(String, f64), String> {
