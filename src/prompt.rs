@@ -1,16 +1,14 @@
 use crate::linear::IssueData;
 
-pub fn build_prompt(issue: &IssueData, worktree: bool, chrome: bool, base_branch: &str) -> String {
+pub fn build_prompt(issue: &IssueData, chrome: bool, base_branch: &str) -> String {
     let mut prompt = issue.prompt.clone();
 
     prompt.push_str("\n\n---\n\n");
 
-    if worktree || !issue.branch_name.is_empty() {
-        prompt.push_str(&format!(
-            "You are on working branch `{}`.\n\n",
-            issue.branch_name
-        ));
-    }
+    prompt.push_str(&format!(
+        "You are on working branch `{}`.\n\n",
+        issue.branch_name
+    ));
 
     prompt.push_str(&format!(
         "Follow this workflow:\n\

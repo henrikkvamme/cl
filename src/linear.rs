@@ -12,6 +12,20 @@ pub struct IssueSummary {
     pub assignee_id: Option<String>,
 }
 
+impl IssueSummary {
+    fn from_node(n: &Value) -> Self {
+        Self {
+            identifier: n["identifier"].as_str().unwrap_or("").to_string(),
+            title: n["title"].as_str().unwrap_or("").to_string(),
+            priority: n["priority"].as_i64().unwrap_or(0),
+            priority_label: n["priorityLabel"].as_str().unwrap_or("").to_string(),
+            state_name: n["state"]["name"].as_str().unwrap_or("").to_string(),
+            state_type: n["state"]["type"].as_str().unwrap_or("").to_string(),
+            assignee_id: n["assignee"]["id"].as_str().map(String::from),
+        }
+    }
+}
+
 impl fmt::Display for IssueSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let pri = if self.priority_label.is_empty() {
@@ -403,18 +417,7 @@ pub fn fetch_team_issues(
         .as_array()
         .ok_or("No issues in response")?;
 
-    let mut issues: Vec<IssueSummary> = nodes
-        .iter()
-        .map(|n| IssueSummary {
-            identifier: n["identifier"].as_str().unwrap_or("").to_string(),
-            title: n["title"].as_str().unwrap_or("").to_string(),
-            priority: n["priority"].as_i64().unwrap_or(0),
-            priority_label: n["priorityLabel"].as_str().unwrap_or("").to_string(),
-            state_name: n["state"]["name"].as_str().unwrap_or("").to_string(),
-            state_type: n["state"]["type"].as_str().unwrap_or("").to_string(),
-            assignee_id: n["assignee"]["id"].as_str().map(String::from),
-        })
-        .collect();
+    let mut issues: Vec<IssueSummary> = nodes.iter().map(IssueSummary::from_node).collect();
 
     sort_issues(&mut issues);
     Ok((issues, viewer_id))
@@ -473,18 +476,7 @@ pub fn fetch_issue_statuses(
         .as_array()
         .ok_or("No issues in response")?;
 
-    Ok(nodes
-        .iter()
-        .map(|n| IssueSummary {
-            identifier: n["identifier"].as_str().unwrap_or("").to_string(),
-            title: n["title"].as_str().unwrap_or("").to_string(),
-            priority: n["priority"].as_i64().unwrap_or(0),
-            priority_label: n["priorityLabel"].as_str().unwrap_or("").to_string(),
-            state_name: n["state"]["name"].as_str().unwrap_or("").to_string(),
-            state_type: n["state"]["type"].as_str().unwrap_or("").to_string(),
-            assignee_id: n["assignee"]["id"].as_str().map(String::from),
-        })
-        .collect())
+    Ok(nodes.iter().map(IssueSummary::from_node).collect())
 }
 
 pub fn parse_team_and_number(identifier: &str) -> Result<(String, f64), String> {

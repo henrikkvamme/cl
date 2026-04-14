@@ -25,10 +25,7 @@ impl fmt::Display for PickerItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PickerItem::Session { worktree, title } => {
-                let id = worktree
-                    .identifier
-                    .as_deref()
-                    .unwrap_or(&worktree.branch);
+                let id = worktree.display_name();
                 let ago = git::time_ago(worktree.last_activity);
                 write!(f, "{id}  {title}  ({ago})")
             }
@@ -44,7 +41,7 @@ impl PickerItem {
             PickerItem::Session { worktree, title } => {
                 format!(
                     "{} {}",
-                    worktree.identifier.as_deref().unwrap_or(&worktree.branch),
+                    worktree.display_name(),
                     title,
                 )
             }
@@ -118,13 +115,14 @@ pub fn show_unified_picker(
         return Err("No issues or sessions found.".into());
     }
 
-    let scorer = |input: &str, item: &PickerItem, _display: &str, _idx: usize| -> Option<i64> {
+    let item_count = items.len() as i64;
+    let scorer = |input: &str, item: &PickerItem, _display: &str, idx: usize| -> Option<i64> {
+        // Use (item_count - idx) as score to preserve original insertion order.
+        // inquire sorts by score descending, so first items get the highest score.
+        let position_score = item_count - idx as i64;
+
         if input.is_empty() {
-            // Show everything when no filter, but hide nothing
-            return match item {
-                PickerItem::Separator(_) => Some(0),
-                _ => Some(1),
-            };
+            return Some(position_score);
         }
         // Hide separators when filtering
         if matches!(item, PickerItem::Separator(_)) {
@@ -132,9 +130,8 @@ pub fn show_unified_picker(
         }
         let haystack = item.searchable_text().to_lowercase();
         let needle = input.to_lowercase();
-        // All terms must match
         if needle.split_whitespace().all(|term| haystack.contains(term)) {
-            Some(1)
+            Some(position_score)
         } else {
             None
         }

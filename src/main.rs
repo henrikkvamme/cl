@@ -157,20 +157,11 @@ fn run_picker(
         process::exit(1);
     });
 
-    // Fetch titles for active sessions from Linear
-    let session_ids: Vec<&str> = worktrees
+    // Build session titles from already-fetched issues (avoids extra API call)
+    let session_titles: HashMap<String, String> = issues
         .iter()
-        .filter_map(|w| w.identifier.as_deref())
+        .map(|i| (i.identifier.clone(), i.title.clone()))
         .collect();
-    let session_titles: HashMap<String, String> = if !session_ids.is_empty() {
-        linear::fetch_issue_statuses(&api_key, &session_ids)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| (s.identifier, s.title))
-            .collect()
-    } else {
-        HashMap::new()
-    };
 
     let result =
         picker::show_unified_picker(worktrees, issues, &viewer_id, &session_titles)
@@ -181,7 +172,7 @@ fn run_picker(
 
     match result {
         picker::PickerResult::ResumeSession(wt) => {
-            let name = wt.identifier.as_deref().unwrap_or(&wt.branch);
+            let name = wt.display_name();
             eprintln!("Resuming session in {}...", wt.path.display());
             claude::exec_claude_resume(name, &wt.path, cfg);
         }
@@ -250,7 +241,7 @@ fn run_start(
         claude::ensure_chrome_running();
     }
 
-    let prompt = prompt::build_prompt(&issue, worktree, chrome, base_branch);
+    let prompt = prompt::build_prompt(&issue, chrome, base_branch);
     claude::exec_claude(
         &issue,
         &prompt,
@@ -293,13 +284,7 @@ fn run_status() {
     let pr_urls: HashMap<String, String> = worktrees
         .iter()
         .filter_map(|w| {
-            let url = std::process::Command::new("gh")
-                .args(["pr", "view", &w.branch, "--json", "url", "-q", ".url"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())?;
+            let url = git::gh_pr_field(&w.branch, "url")?;
             Some((w.branch.clone(), url))
         })
         .collect();
@@ -307,7 +292,7 @@ fn run_status() {
     println!("Active Sessions");
     println!("{}", "─".repeat(60));
     for wt in &worktrees {
-        let id = wt.identifier.as_deref().unwrap_or(&wt.branch);
+        let id = wt.display_name();
         let ago = git::time_ago(wt.last_activity);
 
         let (status, title) = statuses
@@ -342,26 +327,21 @@ fn run_clean() {
         .collect();
 
     // Fetch statuses to find completed/cancelled issues
-    let statuses: HashMap<String, String> = if !ids.is_empty() {
+    let statuses: HashMap<String, linear::IssueSummary> = if !ids.is_empty() {
         linear::fetch_issue_statuses(&api_key, &ids)
             .unwrap_or_default()
             .into_iter()
-            .map(|s| (s.identifier.clone(), s.state_name.clone()))
+            .map(|s| (s.identifier.clone(), s))
             .collect()
     } else {
         HashMap::new()
     };
 
-    // Also check which branches have merged PRs
+    // Check which branches have merged PRs
     let merged_branches: Vec<String> = worktrees
         .iter()
         .filter(|w| {
-            std::process::Command::new("gh")
-                .args(["pr", "view", &w.branch, "--json", "state", "-q", ".state"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            git::gh_pr_field(&w.branch, "state")
                 .is_some_and(|s| s == "MERGED")
         })
         .map(|w| w.branch.clone())
@@ -374,9 +354,8 @@ fn run_clean() {
                 .identifier
                 .as_ref()
                 .and_then(|id| statuses.get(id))
-                .is_some_and(|state| {
-                    let s = state.to_lowercase();
-                    s.contains("done") || s.contains("complete") || s.contains("cancel")
+                .is_some_and(|s| {
+                    matches!(s.state_type.as_str(), "completed" | "cancelled")
                 });
             let is_merged = merged_branches.contains(&w.branch);
             is_done || is_merged
@@ -390,12 +369,12 @@ fn run_clean() {
 
     println!("Stale worktrees:");
     for wt in &stale {
-        let id = wt.identifier.as_deref().unwrap_or(&wt.branch);
+        let id = wt.display_name();
         let status = wt
             .identifier
             .as_ref()
             .and_then(|i| statuses.get(i))
-            .map(|s| s.as_str())
+            .map(|s| s.state_name.as_str())
             .unwrap_or("");
         let merged = if merged_branches.contains(&wt.branch) {
             " (PR merged)"
@@ -416,7 +395,7 @@ fn run_clean() {
     }
 
     for wt in &stale {
-        let id = wt.identifier.as_deref().unwrap_or(&wt.branch);
+        let id = wt.display_name();
         match git::remove_worktree(&wt.path) {
             Ok(()) => {
                 eprintln!("Removed worktree: {id}");

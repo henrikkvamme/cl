@@ -15,6 +15,16 @@ pub fn ensure_chrome_running() {
     }
 }
 
+fn base_cmd(name: &str, cfg: &ClConfig) -> Command {
+    let mut cmd = Command::new("claude");
+    if cfg.skip_permissions() {
+        cmd.arg("--allow-dangerously-skip-permissions");
+    }
+    cmd.args(["--name", name]);
+    cmd.args(["--permission-mode", cfg.permission_mode()]);
+    cmd
+}
+
 pub fn exec_claude(
     issue: &IssueData,
     prompt: &str,
@@ -22,22 +32,14 @@ pub fn exec_claude(
     chrome: bool,
     cfg: &ClConfig,
 ) -> ! {
-    let mut cmd = Command::new("claude");
-
-    if cfg.skip_permissions() {
-        cmd.arg("--allow-dangerously-skip-permissions");
-    }
-    cmd.args(["--name", &issue.identifier]);
-    cmd.args(["--permission-mode", cfg.permission_mode()]);
+    let mut cmd = base_cmd(&issue.identifier, cfg);
 
     if chrome {
         cmd.arg("--chrome");
     }
-
     if let Some(path) = worktree_path {
         cmd.current_dir(path);
     }
-
     cmd.arg(prompt);
 
     let err = cmd.exec();
@@ -46,13 +48,7 @@ pub fn exec_claude(
 }
 
 pub fn exec_claude_resume(name: &str, worktree_path: &Path, cfg: &ClConfig) -> ! {
-    let mut cmd = Command::new("claude");
-
-    if cfg.skip_permissions() {
-        cmd.arg("--allow-dangerously-skip-permissions");
-    }
-    cmd.args(["--name", name]);
-    cmd.args(["--permission-mode", cfg.permission_mode()]);
+    let mut cmd = base_cmd(name, cfg);
     cmd.arg("--continue");
     cmd.current_dir(worktree_path);
 

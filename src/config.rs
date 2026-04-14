@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use serde::{Deserialize, Serialize};
@@ -103,7 +103,7 @@ fn load_workspace_config() -> ClConfig {
     }
 }
 
-fn load_config_file(path: &PathBuf) -> ClConfig {
+fn load_config_file(path: &Path) -> ClConfig {
     match fs::read_to_string(path) {
         Ok(content) => toml::from_str(&content).unwrap_or_else(|e| {
             eprintln!("Warning: Failed to parse {}: {e}", path.display());

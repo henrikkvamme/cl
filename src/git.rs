@@ -9,6 +9,12 @@ pub struct WorktreeInfo {
     pub last_activity: i64,
 }
 
+impl WorktreeInfo {
+    pub fn display_name(&self) -> &str {
+        self.identifier.as_deref().unwrap_or(&self.branch)
+    }
+}
+
 pub fn current_branch() -> Result<String, String> {
     let output = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -122,30 +128,57 @@ pub fn repo_root() -> Result<PathBuf, String> {
 pub fn create_worktree(branch: &str) -> Result<PathBuf, String> {
     let root = repo_root()?;
     let worktree_dir = root.parent().unwrap_or(&root).join(".cl-worktrees");
-    std::fs::create_dir_all(&worktree_dir).map_err(|e| format!("Failed to create worktree dir: {e}"))?;
+    std::fs::create_dir_all(&worktree_dir)
+        .map_err(|e| format!("Failed to create worktree dir: {e}"))?;
 
     let worktree_path = worktree_dir.join(branch);
+    let path_str = worktree_path
+        .to_str()
+        .ok_or("Worktree path is not valid UTF-8")?;
 
-    // Check if worktree already exists
     if worktree_path.exists() {
         return Ok(worktree_path);
     }
 
-    let status = Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            worktree_path.to_str().unwrap(),
-            "-b",
-            branch,
-        ])
-        .status()
+    // Try normal worktree creation first
+    let output = Command::new("git")
+        .args(["worktree", "add", path_str, "-b", branch])
+        .output()
         .map_err(|e| format!("Failed to create worktree: {e}"))?;
-    if !status.success() {
-        return Err(format!("git worktree add failed for branch {branch}"));
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // If it failed due to smudge filters (e.g. git-crypt), retry with --no-checkout
+        if stderr.contains("smudge filter") || stderr.contains("git-crypt") {
+            eprintln!("Worktree checkout failed (git-crypt/smudge filter). Retrying without checkout...");
+
+            // Clean up the failed worktree if partially created
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force", path_str])
+                .status();
+
+            let retry = Command::new("git")
+                .args(["worktree", "add", "--no-checkout", path_str, "-b", branch])
+                .status()
+                .map_err(|e| format!("Failed to create worktree: {e}"))?;
+
+            if !retry.success() {
+                return Err(format!("git worktree add --no-checkout failed for branch {branch}"));
+            }
+
+            // Checkout everything except git-crypt encrypted files
+            let _ = Command::new("git")
+                .args(["checkout", "HEAD", "--", "."])
+                .current_dir(&worktree_path)
+                .status();
+        } else {
+            return Err(format!(
+                "git worktree add failed for branch {branch}: {stderr}"
+            ));
+        }
     }
 
-    // Symlink .env files from repo root
     symlink_env_files(&worktree_path, &root);
 
     Ok(worktree_path)
@@ -253,6 +286,17 @@ pub fn delete_branch(name: &str) -> Result<(), String> {
         return Err(format!("git branch -d {name} failed"));
     }
     Ok(())
+}
+
+pub fn gh_pr_field(branch: &str, field: &str) -> Option<String> {
+    let query = format!(".{field}");
+    Command::new("gh")
+        .args(["pr", "view", branch, "--json", field, "-q", &query])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn time_ago(timestamp: i64) -> String {
