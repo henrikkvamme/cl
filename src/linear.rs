@@ -5,11 +5,9 @@ use serde_json::{Value, json};
 pub struct IssueSummary {
     pub identifier: String,
     pub title: String,
-    pub priority: i64,
     pub priority_label: String,
     pub state_name: String,
     pub assignee_id: Option<String>,
-    pub assignee_name: Option<String>,
 }
 
 impl fmt::Display for IssueSummary {
@@ -370,11 +368,9 @@ pub fn fetch_team_issues(
         .map(|n| IssueSummary {
             identifier: n["identifier"].as_str().unwrap_or("").to_string(),
             title: n["title"].as_str().unwrap_or("").to_string(),
-            priority: n["priority"].as_i64().unwrap_or(4),
             priority_label: n["priorityLabel"].as_str().unwrap_or("").to_string(),
             state_name: n["state"]["name"].as_str().unwrap_or("").to_string(),
             assignee_id: n["assignee"]["id"].as_str().map(String::from),
-            assignee_name: n["assignee"]["name"].as_str().map(String::from),
         })
         .collect();
 
@@ -417,11 +413,9 @@ pub fn fetch_issue_statuses(
         .map(|n| IssueSummary {
             identifier: n["identifier"].as_str().unwrap_or("").to_string(),
             title: n["title"].as_str().unwrap_or("").to_string(),
-            priority: n["priority"].as_i64().unwrap_or(4),
             priority_label: n["priorityLabel"].as_str().unwrap_or("").to_string(),
             state_name: n["state"]["name"].as_str().unwrap_or("").to_string(),
             assignee_id: n["assignee"]["id"].as_str().map(String::from),
-            assignee_name: n["assignee"]["name"].as_str().map(String::from),
         })
         .collect())
 }
