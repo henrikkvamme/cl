@@ -47,6 +47,8 @@ enum Commands {
     Config,
     /// Show active sessions with Linear status
     Status,
+    /// Remove worktrees for completed/cancelled issues
+    Clean,
 }
 
 fn main() {
@@ -62,6 +64,9 @@ fn main() {
         }
         Some(Commands::Status) => {
             run_status();
+        }
+        Some(Commands::Clean) => {
+            run_clean();
         }
         None => {
             // CLI flags override config
@@ -278,4 +283,110 @@ fn run_status() {
 
         println!("{id}  {status}  {title}  ({ago}){pr}");
     }
+}
+
+fn run_clean() {
+    let worktrees = git::list_worktrees().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    if worktrees.is_empty() {
+        println!("No worktrees to clean.");
+        return;
+    }
+
+    let api_key = config::load_token();
+    let ids: Vec<&str> = worktrees
+        .iter()
+        .filter_map(|w| w.identifier.as_deref())
+        .collect();
+
+    // Fetch statuses to find completed/cancelled issues
+    let statuses: HashMap<String, String> = if !ids.is_empty() {
+        linear::fetch_issue_statuses(&api_key, &ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.identifier.clone(), s.state_name.clone()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    // Also check which branches have merged PRs
+    let merged_branches: Vec<String> = worktrees
+        .iter()
+        .filter(|w| {
+            std::process::Command::new("gh")
+                .args(["pr", "view", &w.branch, "--json", "state", "-q", ".state"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .is_some_and(|s| s == "MERGED")
+        })
+        .map(|w| w.branch.clone())
+        .collect();
+
+    let stale: Vec<&git::WorktreeInfo> = worktrees
+        .iter()
+        .filter(|w| {
+            let is_done = w
+                .identifier
+                .as_ref()
+                .and_then(|id| statuses.get(id))
+                .is_some_and(|state| {
+                    let s = state.to_lowercase();
+                    s.contains("done") || s.contains("complete") || s.contains("cancel")
+                });
+            let is_merged = merged_branches.contains(&w.branch);
+            is_done || is_merged
+        })
+        .collect();
+
+    if stale.is_empty() {
+        println!("No stale worktrees to clean.");
+        return;
+    }
+
+    println!("Stale worktrees:");
+    for wt in &stale {
+        let id = wt.identifier.as_deref().unwrap_or(&wt.branch);
+        let status = wt
+            .identifier
+            .as_ref()
+            .and_then(|i| statuses.get(i))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let merged = if merged_branches.contains(&wt.branch) {
+            " (PR merged)"
+        } else {
+            ""
+        };
+        println!("  {id}  {status}{merged}  {}", wt.path.display());
+    }
+
+    let confirm = inquire::Confirm::new("Remove these worktrees?")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false);
+
+    if !confirm {
+        println!("Aborted.");
+        return;
+    }
+
+    for wt in &stale {
+        let id = wt.identifier.as_deref().unwrap_or(&wt.branch);
+        match git::remove_worktree(&wt.path) {
+            Ok(()) => {
+                eprintln!("Removed worktree: {id}");
+                if let Err(e) = git::delete_branch(&wt.branch) {
+                    eprintln!("Warning: {e}");
+                }
+            }
+            Err(e) => eprintln!("Warning: Failed to remove {id}: {e}"),
+        }
+    }
+    println!("Done.");
 }
