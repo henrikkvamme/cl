@@ -5,15 +5,20 @@ use inquire::Select;
 use crate::git::{self, WorktreeInfo};
 use crate::linear::IssueSummary;
 
+enum ItemKind {
+    Session,
+    MyIssue,
+    TeamIssue,
+}
+
 pub enum PickerItem {
     Session {
         worktree: WorktreeInfo,
         title: String,
-        first_in_section: bool,
     },
     Issue {
         issue: IssueSummary,
-        first_in_section: bool,
+        mine: bool,
     },
 }
 
@@ -22,40 +27,23 @@ pub enum PickerResult {
     StartIssue(String),
 }
 
-impl fmt::Display for PickerItem {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl PickerItem {
+    fn kind(&self) -> ItemKind {
         match self {
-            PickerItem::Session {
-                worktree,
-                title,
-                first_in_section,
-            } => {
-                if *first_in_section {
-                    write!(f, "── Active Sessions ──\n  ")?;
-                }
-                let id = worktree.display_name();
-                let ago = git::time_ago(worktree.last_activity);
-                write!(f, "{id}  {title}  ({ago})")
-            }
-            PickerItem::Issue {
-                issue,
-                first_in_section,
-            } => {
-                if *first_in_section {
-                    let section = if issue.assignee_id.is_some() {
-                        "My Issues"
-                    } else {
-                        "Team Issues"
-                    };
-                    write!(f, "── {section} ──\n  ")?;
-                }
-                write!(f, "{issue}")
-            }
+            PickerItem::Session { .. } => ItemKind::Session,
+            PickerItem::Issue { mine: true, .. } => ItemKind::MyIssue,
+            PickerItem::Issue { mine: false, .. } => ItemKind::TeamIssue,
         }
     }
-}
 
-impl PickerItem {
+    fn marker(&self) -> &str {
+        match self.kind() {
+            ItemKind::Session => "▶",
+            ItemKind::MyIssue => "●",
+            ItemKind::TeamIssue => " ",
+        }
+    }
+
     fn searchable_text(&self) -> String {
         match self {
             PickerItem::Session { worktree, title, .. } => {
@@ -63,6 +51,22 @@ impl PickerItem {
             }
             PickerItem::Issue { issue, .. } => {
                 format!("{} {} {}", issue.identifier, issue.title, issue.priority_label)
+            }
+        }
+    }
+}
+
+impl fmt::Display for PickerItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let marker = self.marker();
+        match self {
+            PickerItem::Session { worktree, title, .. } => {
+                let id = worktree.display_name();
+                let ago = git::time_ago(worktree.last_activity);
+                write!(f, "{marker} {id}  {title}  ({ago})")
+            }
+            PickerItem::Issue { issue, .. } => {
+                write!(f, "{marker} {issue}")
             }
         }
     }
@@ -81,18 +85,14 @@ pub fn show_unified_picker(
         .filter_map(|w| w.identifier.clone())
         .collect();
 
-    for (i, wt) in worktrees.into_iter().enumerate() {
+    for wt in worktrees {
         let title = wt
             .identifier
             .as_ref()
             .and_then(|id| session_titles.get(id))
             .cloned()
             .unwrap_or_default();
-        items.push(PickerItem::Session {
-            worktree: wt,
-            title,
-            first_in_section: i == 0,
-        });
+        items.push(PickerItem::Session { worktree: wt, title });
     }
 
     let (my_issues, team_issues): (Vec<_>, Vec<_>) = issues
@@ -100,18 +100,12 @@ pub fn show_unified_picker(
         .filter(|i| !active_ids.contains(&i.identifier))
         .partition(|i| i.assignee_id.as_deref() == Some(viewer_id));
 
-    for (i, issue) in my_issues.into_iter().enumerate() {
-        items.push(PickerItem::Issue {
-            issue,
-            first_in_section: i == 0,
-        });
+    for issue in my_issues {
+        items.push(PickerItem::Issue { issue, mine: true });
     }
 
-    for (i, issue) in team_issues.into_iter().enumerate() {
-        items.push(PickerItem::Issue {
-            issue,
-            first_in_section: i == 0,
-        });
+    for issue in team_issues {
+        items.push(PickerItem::Issue { issue, mine: false });
     }
 
     if items.is_empty() {
@@ -119,13 +113,12 @@ pub fn show_unified_picker(
     }
 
     let item_count = items.len() as i64;
-    let scorer = |input: &str, _item: &PickerItem, _display: &str, idx: usize| -> Option<i64> {
+    let scorer = |input: &str, item: &PickerItem, _display: &str, idx: usize| -> Option<i64> {
         let position_score = item_count - idx as i64;
-
         if input.is_empty() {
             return Some(position_score);
         }
-        let haystack = _item.searchable_text().to_lowercase();
+        let haystack = item.searchable_text().to_lowercase();
         let needle = input.to_lowercase();
         if needle.split_whitespace().all(|term| haystack.contains(term)) {
             Some(position_score)
