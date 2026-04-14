@@ -215,65 +215,83 @@ fn run_start(
     eprintln!("  {} — {}", issue.identifier, issue.title);
     eprintln!("  Branch: {}", issue.branch_name);
 
-    // Check for existing worktree
+    // Check for existing worktrees for this issue
     if worktree {
-        let existing = git::list_worktrees()
-            .unwrap_or_default()
+        let all_worktrees = git::list_worktrees().unwrap_or_default();
+        let existing: Vec<git::WorktreeInfo> = all_worktrees
             .into_iter()
-            .find(|w| w.identifier.as_deref() == Some(&identifier));
+            .filter(|w| {
+                w.identifier.as_deref() == Some(&identifier)
+                    || w.branch == issue.branch_name
+                    || w.branch.starts_with(&format!("{}-", issue.branch_name))
+            })
+            .collect();
 
-        if let Some(wt) = existing {
-            eprintln!("  Session exists ({})", git::time_ago(wt.last_activity));
+        if !existing.is_empty() {
+            let count = existing.len();
+            eprintln!(
+                "  {} existing session{}",
+                count,
+                if count > 1 { "s" } else { "" }
+            );
             eprintln!();
 
-            let choice = inquire::Select::new(
-                "Session action:",
-                vec!["Continue session", "New session", "Fork session"],
-            )
-            .prompt()
-            .unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                process::exit(1);
-            });
+            // Build picker items: sessions + New + Fork
+            let mut options: Vec<String> = existing
+                .iter()
+                .map(|wt| format!("▶ {}  ({})", wt.branch, git::time_ago(wt.last_activity)))
+                .collect();
+            options.push("New session".to_string());
+            options.push("Fork session".to_string());
 
-            match choice {
-                "Continue session" => {
-                    claude::exec_claude_resume(wt.display_name(), &wt.path, cfg);
-                }
-                "Fork session" => {
-                    // Find next available suffix
-                    let worktrees = git::list_worktrees().unwrap_or_default();
-                    let mut n = 2;
-                    loop {
-                        let fork_branch = format!("{}-{n}", issue.branch_name);
-                        let taken = worktrees.iter().any(|w| w.branch == fork_branch);
-                        if !taken {
-                            linear::update_issue(&api_key, &issue);
-                            let path = git::create_worktree(&fork_branch).unwrap_or_else(|e| {
-                                eprintln!("Error: {e}");
-                                process::exit(1);
-                            });
-                            eprintln!("  Forked: {}", path.display());
-                            eprintln!();
-                            if chrome {
-                                claude::ensure_chrome_running();
-                            }
-                            let prompt = prompt::build_prompt(&issue, chrome, base_branch);
-                            claude::exec_claude(&issue, &prompt, Some(&path), chrome, cfg);
+            let choice = inquire::Select::new("Session action:", options)
+                .prompt()
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                });
+
+            if choice == "Fork session" {
+                let mut n = 2;
+                loop {
+                    let fork_branch = format!("{}-{n}", issue.branch_name);
+                    let taken = existing.iter().any(|w| w.branch == fork_branch);
+                    if !taken {
+                        linear::update_issue(&api_key, &issue);
+                        let path = git::create_worktree(&fork_branch).unwrap_or_else(|e| {
+                            eprintln!("Error: {e}");
+                            process::exit(1);
+                        });
+                        eprintln!("  Forked: {}", path.display());
+                        eprintln!();
+                        if chrome {
+                            claude::ensure_chrome_running();
                         }
-                        n += 1;
+                        let prompt = prompt::build_prompt(&issue, chrome, base_branch);
+                        claude::exec_claude(&issue, &prompt, Some(&path), chrome, cfg);
                     }
+                    n += 1;
                 }
-                _ => {
-                    // New session — continue to create fresh prompt in existing worktree
-                    linear::update_issue(&api_key, &issue);
-                    eprintln!();
-                    if chrome {
-                        claude::ensure_chrome_running();
-                    }
-                    let prompt = prompt::build_prompt(&issue, chrome, base_branch);
-                    claude::exec_claude(&issue, &prompt, Some(&wt.path), chrome, cfg);
+            } else if choice == "New session" {
+                // Fresh prompt in the first existing worktree
+                let wt = &existing[0];
+                linear::update_issue(&api_key, &issue);
+                eprintln!();
+                if chrome {
+                    claude::ensure_chrome_running();
                 }
+                let prompt = prompt::build_prompt(&issue, chrome, base_branch);
+                claude::exec_claude(&issue, &prompt, Some(&wt.path), chrome, cfg);
+            } else {
+                // Selected a session — find which one
+                let idx = existing
+                    .iter()
+                    .position(|wt| {
+                        choice.contains(&wt.branch)
+                    })
+                    .unwrap_or(0);
+                let wt = &existing[idx];
+                claude::exec_claude_resume(wt.display_name(), &wt.path, cfg);
             }
         }
     }
