@@ -45,6 +45,8 @@ enum Commands {
     },
     /// Print current merged configuration
     Config,
+    /// Show active sessions with Linear status
+    Status,
 }
 
 fn main() {
@@ -57,6 +59,9 @@ fn main() {
         }
         Some(Commands::Config) => {
             config::print_config(&cfg);
+        }
+        Some(Commands::Status) => {
+            run_status();
         }
         None => {
             // CLI flags override config
@@ -209,4 +214,68 @@ fn run_start(
         chrome,
         cfg,
     );
+}
+
+fn run_status() {
+    let worktrees = git::list_worktrees().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    if worktrees.is_empty() {
+        println!("No active sessions.");
+        return;
+    }
+
+    // Fetch issue statuses from Linear
+    let api_key = config::load_token();
+    let ids: Vec<&str> = worktrees
+        .iter()
+        .filter_map(|w| w.identifier.as_deref())
+        .collect();
+
+    let statuses: HashMap<String, linear::IssueSummary> =
+        if !ids.is_empty() {
+            linear::fetch_issue_statuses(&api_key, &ids)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| (s.identifier.clone(), s))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+    // Check for PRs via gh
+    let pr_urls: HashMap<String, String> = worktrees
+        .iter()
+        .filter_map(|w| {
+            let url = std::process::Command::new("gh")
+                .args(["pr", "view", &w.branch, "--json", "url", "-q", ".url"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())?;
+            Some((w.branch.clone(), url))
+        })
+        .collect();
+
+    println!("Active Sessions");
+    println!("{}", "─".repeat(60));
+    for wt in &worktrees {
+        let id = wt.identifier.as_deref().unwrap_or(&wt.branch);
+        let ago = git::time_ago(wt.last_activity);
+
+        let (status, title) = statuses
+            .get(id)
+            .map(|s| (s.state_name.as_str(), s.title.as_str()))
+            .unwrap_or(("", ""));
+
+        let pr = pr_urls
+            .get(&wt.branch)
+            .map(|u| format!("  {u}"))
+            .unwrap_or_default();
+
+        println!("{id}  {status}  {title}  ({ago}){pr}");
+    }
 }
