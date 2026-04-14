@@ -21,7 +21,6 @@ fn base_cmd(name: &str, cfg: &ClConfig) -> Command {
         cmd.arg("--allow-dangerously-skip-permissions");
     }
     cmd.args(["--name", name]);
-    cmd.args(["--permission-mode", cfg.permission_mode()]);
     cmd
 }
 

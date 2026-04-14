@@ -10,6 +10,11 @@ pub fn build_prompt(issue: &IssueData, chrome: bool, base_branch: &str) -> Strin
         issue.branch_name
     ));
 
+    prompt.push_str(
+        "Start by entering plan mode (/plan) to analyze the issue and design your approach. \
+         For trivial changes (typo fixes, single-line changes), you may skip planning and implement directly.\n\n",
+    );
+
     prompt.push_str(&format!(
         "Follow this workflow:\n\
          1. Read the issue description and plan your implementation approach.\n\

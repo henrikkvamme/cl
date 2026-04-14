@@ -21,8 +21,6 @@ pub struct WorkspaceConfig {
 pub struct ClaudeConfig {
     /// Whether to pass --allow-dangerously-skip-permissions (default: false)
     pub skip_permissions: Option<bool>,
-    /// Claude permission mode (default: "plan")
-    pub permission_mode: Option<String>,
     /// Enable Chrome integration by default
     pub chrome: Option<bool>,
     /// Default mode: "worktree", "branch", or "raw"
@@ -41,7 +39,6 @@ impl ClConfig {
         let claude = match (self.claude, other.claude) {
             (Some(a), Some(b)) => Some(ClaudeConfig {
                 skip_permissions: b.skip_permissions.or(a.skip_permissions),
-                permission_mode: b.permission_mode.or(a.permission_mode),
                 chrome: b.chrome.or(a.chrome),
                 mode: b.mode.or(a.mode),
             }),
@@ -59,13 +56,6 @@ impl ClConfig {
             .as_ref()
             .and_then(|c| c.skip_permissions)
             .unwrap_or(false)
-    }
-
-    pub fn permission_mode(&self) -> &str {
-        self.claude
-            .as_ref()
-            .and_then(|c| c.permission_mode.as_deref())
-            .unwrap_or("plan")
     }
 
     pub fn chrome(&self) -> bool {
