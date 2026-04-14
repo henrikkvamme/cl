@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::process;
 
 use clap::{Parser, Subcommand};
+use inquire::Select;
 
 #[derive(Parser)]
 #[command(name = "cl", about = "Bridge Linear issues to Claude Code")]
@@ -99,6 +100,43 @@ fn main() {
     }
 }
 
+/// Resolve team from config, or show a picker if not configured.
+fn resolve_team(cfg: &config::ClConfig, api_key: &str) -> String {
+    if let Some(team) = cfg.team() {
+        return team.to_string();
+    }
+
+    eprintln!("No team configured. Fetching teams from Linear...");
+    let teams = linear::fetch_teams(api_key).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    if teams.is_empty() {
+        eprintln!("Error: No teams found in your Linear workspace.");
+        process::exit(1);
+    }
+
+    if teams.len() == 1 {
+        let team = &teams[0];
+        eprintln!("Using team: {} ({})", team.key, team.name);
+        return team.key.clone();
+    }
+
+    let selected = Select::new("Select team:", teams)
+        .prompt()
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        });
+
+    eprintln!(
+        "Tip: Set [workspace] team = \"{}\" in .cl/config.toml to skip this prompt.",
+        selected.key
+    );
+    selected.key
+}
+
 fn run_picker(
     branch: bool,
     worktree: bool,
@@ -106,12 +144,8 @@ fn run_picker(
     base_branch: &str,
     cfg: &config::ClConfig,
 ) {
-    let team = cfg.team().unwrap_or_else(|| {
-        eprintln!("Error: No team configured. Set [workspace] team in .cl/config.toml");
-        process::exit(1);
-    });
-
     let api_key = config::load_token();
+    let team = resolve_team(cfg, &api_key);
 
     // Fetch worktrees and issues in sequence (both need the API key context)
     let worktrees = git::list_worktrees().unwrap_or_else(|e| {
@@ -120,7 +154,7 @@ fn run_picker(
     });
 
     eprintln!("Fetching issues for team {team}...");
-    let (issues, viewer_id) = linear::fetch_team_issues(&api_key, team).unwrap_or_else(|e| {
+    let (issues, viewer_id) = linear::fetch_team_issues(&api_key, &team).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         process::exit(1);
     });
@@ -167,13 +201,20 @@ fn run_start(
     base_branch: &str,
     cfg: &config::ClConfig,
 ) {
+    let api_key = config::load_token();
+
+    // Resolve team if needed (bare number input)
+    let team = if issue_input.chars().all(|c| c.is_ascii_digit()) && cfg.team().is_none() {
+        Some(resolve_team(cfg, &api_key))
+    } else {
+        cfg.team().map(String::from)
+    };
+
     let identifier =
-        linear::resolve_identifier(issue_input, cfg.team()).unwrap_or_else(|e| {
+        linear::resolve_identifier(issue_input, team.as_deref()).unwrap_or_else(|e| {
             eprintln!("Error: {e}");
             process::exit(1);
         });
-
-    let api_key = config::load_token();
 
     eprintln!("Fetching issue {identifier}...");
     let issue = linear::fetch_issue(&api_key, &identifier).unwrap_or_else(|e| {

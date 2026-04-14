@@ -324,6 +324,44 @@ pub fn update_issue(api_key: &str, issue: &IssueData) {
     }
 }
 
+pub struct TeamInfo {
+    pub key: String,
+    pub name: String,
+}
+
+impl fmt::Display for TeamInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}  {}", self.key, self.name)
+    }
+}
+
+/// Fetch all teams the viewer has access to.
+pub fn fetch_teams(api_key: &str) -> Result<Vec<TeamInfo>, String> {
+    let query = r#"
+        query {
+            teams {
+                nodes {
+                    key
+                    name
+                }
+            }
+        }
+    "#;
+
+    let data = graphql(api_key, query, json!({}))?;
+    let nodes = data["teams"]["nodes"]
+        .as_array()
+        .ok_or("No teams in response")?;
+
+    Ok(nodes
+        .iter()
+        .map(|n| TeamInfo {
+            key: n["key"].as_str().unwrap_or("").to_string(),
+            name: n["name"].as_str().unwrap_or("").to_string(),
+        })
+        .collect())
+}
+
 /// Fetch open issues for a team. Returns (issues, viewer_id).
 pub fn fetch_team_issues(
     api_key: &str,
