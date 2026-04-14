@@ -195,11 +195,36 @@ fn try_no_checkout(path_str: &str, branch: &str, stderr: &str) -> Result<(), Str
         return Err(format!("git worktree add --no-checkout failed for branch {branch}"));
     }
 
+    // Disable git-crypt smudge/clean filters in this worktree so checkout succeeds.
+    // The encrypted files will remain in their encrypted form, but we symlink
+    // .env from the main repo anyway.
     let _ = Command::new("git")
-        .args(["checkout", "HEAD", "--", "."])
+        .args(["config", "--worktree", "filter.git-crypt.smudge", "cat"])
+        .current_dir(path_str)
+        .status();
+    let _ = Command::new("git")
+        .args(["config", "--worktree", "filter.git-crypt.clean", "cat"])
+        .current_dir(path_str)
+        .status();
+    let _ = Command::new("git")
+        .args(["config", "--worktree", "filter.git-crypt.required", "false"])
         .current_dir(path_str)
         .status();
 
+    // Now checkout should succeed — encrypted files get the raw content
+    let checkout = Command::new("git")
+        .args(["checkout", "HEAD", "--", "."])
+        .current_dir(path_str)
+        .output();
+
+    if let Ok(out) = checkout {
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            eprintln!("Warning: checkout partially failed: {err}");
+        }
+    }
+
+    eprintln!("Note: git-crypt files are not decrypted in worktree. .env will be symlinked from main repo.");
     Ok(())
 }
 
