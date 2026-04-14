@@ -151,7 +151,7 @@ fn run_picker(
         Vec::new()
     });
 
-    eprintln!("Fetching issues for team {team}...");
+    eprintln!("Fetching issues for {team}...");
     let (issues, viewer_id) = linear::fetch_team_issues(&api_key, &team).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         process::exit(1);
@@ -205,13 +205,15 @@ fn run_start(
             process::exit(1);
         });
 
-    eprintln!("Fetching issue {identifier}...");
+    eprintln!("Fetching {identifier}...");
     let issue = linear::fetch_issue(&api_key, &identifier).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         process::exit(1);
     });
-    eprintln!("Found: {} — {}", issue.identifier, issue.title);
-    eprintln!("Branch: {}", issue.branch_name);
+
+    eprintln!();
+    eprintln!("  {} — {}", issue.identifier, issue.title);
+    eprintln!("  Branch: {}", issue.branch_name);
 
     linear::update_issue(&api_key, &issue);
 
@@ -220,7 +222,7 @@ fn run_start(
             eprintln!("Error: {e}");
             process::exit(1);
         });
-        eprintln!("Worktree: {}", path.display());
+        eprintln!("  Worktree: {}", path.display());
         Some(path)
     } else if branch {
         git::ensure_clean_tree().unwrap_or_else(|e| {
@@ -231,11 +233,11 @@ fn run_start(
             eprintln!("Error: {e}");
             process::exit(1);
         });
-        eprintln!("Created branch: {}", issue.branch_name);
         None
     } else {
         None
     };
+    eprintln!();
 
     if chrome {
         claude::ensure_chrome_running();

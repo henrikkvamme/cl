@@ -86,7 +86,7 @@ pub fn resolve_base_branch(explicit: Option<&str>) -> Result<String, String> {
         return Ok(default);
     }
 
-    eprintln!("Using current branch '{current}' as base (use --base to override)");
+    eprintln!("  Base: {current} (override with --base)");
     Ok(current)
 }
 
