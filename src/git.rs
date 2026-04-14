@@ -180,14 +180,16 @@ fn try_no_checkout(path_str: &str, branch: &str, stderr: &str) -> Result<(), Str
         return Err(format!("git worktree add failed for branch {branch}: {stderr}"));
     }
 
-    eprintln!("Worktree checkout failed (git-crypt/smudge filter). Retrying without checkout...");
-
+    let devnull = std::process::Stdio::null();
     let _ = Command::new("git")
         .args(["worktree", "remove", "--force", path_str])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
 
     let status = Command::new("git")
         .args(["worktree", "add", "--no-checkout", path_str, branch])
+        .stderr(devnull)
         .status()
         .map_err(|e| format!("Failed to create worktree: {e}"))?;
 
@@ -195,11 +197,11 @@ fn try_no_checkout(path_str: &str, branch: &str, stderr: &str) -> Result<(), Str
         return Err(format!("git worktree add --no-checkout failed for branch {branch}"));
     }
 
-    // Enable per-worktree config, then disable git-crypt filters in this worktree.
-    // Encrypted files stay as raw bytes — .env is symlinked from main repo.
+    // Enable per-worktree config, then disable git-crypt filters so checkout works.
     let _ = Command::new("git")
         .args(["config", "extensions.worktreeConfig", "true"])
         .current_dir(path_str)
+        .stderr(std::process::Stdio::null())
         .status();
     for (key, val) in [
         ("filter.git-crypt.smudge", "cat"),
@@ -209,23 +211,17 @@ fn try_no_checkout(path_str: &str, branch: &str, stderr: &str) -> Result<(), Str
         let _ = Command::new("git")
             .args(["config", "--worktree", key, val])
             .current_dir(path_str)
+            .stderr(std::process::Stdio::null())
             .status();
     }
 
-    // Now checkout should succeed — encrypted files get the raw content
-    let checkout = Command::new("git")
+    let _ = Command::new("git")
         .args(["checkout", "HEAD", "--", "."])
         .current_dir(path_str)
-        .output();
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 
-    if let Ok(out) = checkout {
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            eprintln!("Warning: checkout partially failed: {err}");
-        }
-    }
-
-    eprintln!("Note: git-crypt files are not decrypted in worktree. .env will be symlinked from main repo.");
     Ok(())
 }
 
