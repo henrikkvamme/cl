@@ -140,7 +140,7 @@ pub fn create_worktree(branch: &str) -> Result<PathBuf, String> {
         return Ok(worktree_path);
     }
 
-    // Try normal worktree creation first
+    // Try creating worktree with a new branch first, fall back to existing branch
     let output = Command::new("git")
         .args(["worktree", "add", path_str, "-b", branch])
         .output()
@@ -149,29 +149,20 @@ pub fn create_worktree(branch: &str) -> Result<PathBuf, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // If it failed due to smudge filters (e.g. git-crypt), retry with --no-checkout
-        if stderr.contains("smudge filter") || stderr.contains("git-crypt") {
-            eprintln!("Worktree checkout failed (git-crypt/smudge filter). Retrying without checkout...");
-
-            // Clean up the failed worktree if partially created
-            let _ = Command::new("git")
-                .args(["worktree", "remove", "--force", path_str])
-                .status();
-
+        if stderr.contains("already exists") {
+            // Branch exists — use it directly instead of creating
             let retry = Command::new("git")
-                .args(["worktree", "add", "--no-checkout", path_str, "-b", branch])
-                .status()
+                .args(["worktree", "add", path_str, branch])
+                .output()
                 .map_err(|e| format!("Failed to create worktree: {e}"))?;
 
-            if !retry.success() {
-                return Err(format!("git worktree add --no-checkout failed for branch {branch}"));
+            if !retry.status.success() {
+                let retry_err = String::from_utf8_lossy(&retry.stderr);
+                return try_no_checkout(path_str, branch, &retry_err)
+                    .map(|_| worktree_path.clone());
             }
-
-            // Checkout everything except git-crypt encrypted files
-            let _ = Command::new("git")
-                .args(["checkout", "HEAD", "--", "."])
-                .current_dir(&worktree_path)
-                .status();
+        } else if stderr.contains("smudge filter") || stderr.contains("git-crypt") {
+            try_no_checkout(path_str, branch, &stderr)?;
         } else {
             return Err(format!(
                 "git worktree add failed for branch {branch}: {stderr}"
@@ -182,6 +173,34 @@ pub fn create_worktree(branch: &str) -> Result<PathBuf, String> {
     symlink_env_files(&worktree_path, &root);
 
     Ok(worktree_path)
+}
+
+fn try_no_checkout(path_str: &str, branch: &str, stderr: &str) -> Result<(), String> {
+    if !stderr.contains("smudge filter") && !stderr.contains("git-crypt") {
+        return Err(format!("git worktree add failed for branch {branch}: {stderr}"));
+    }
+
+    eprintln!("Worktree checkout failed (git-crypt/smudge filter). Retrying without checkout...");
+
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force", path_str])
+        .status();
+
+    let status = Command::new("git")
+        .args(["worktree", "add", "--no-checkout", path_str, branch])
+        .status()
+        .map_err(|e| format!("Failed to create worktree: {e}"))?;
+
+    if !status.success() {
+        return Err(format!("git worktree add --no-checkout failed for branch {branch}"));
+    }
+
+    let _ = Command::new("git")
+        .args(["checkout", "HEAD", "--", "."])
+        .current_dir(path_str)
+        .status();
+
+    Ok(())
 }
 
 fn symlink_env_files(worktree_path: &Path, repo_root: &Path) {
