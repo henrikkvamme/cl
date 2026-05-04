@@ -10,6 +10,7 @@ pub struct IssueSummary {
     pub state_name: String,
     pub state_type: String,
     pub assignee_id: Option<String>,
+    pub updated_at: String,
 }
 
 impl IssueSummary {
@@ -22,18 +23,24 @@ impl IssueSummary {
             state_name: n["state"]["name"].as_str().unwrap_or("").to_string(),
             state_type: n["state"]["type"].as_str().unwrap_or("").to_string(),
             assignee_id: n["assignee"]["id"].as_str().map(String::from),
+            updated_at: n["updatedAt"].as_str().unwrap_or("").to_string(),
         }
     }
 }
 
 impl fmt::Display for IssueSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = if self.state_name.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", self.state_name)
+        };
         let pri = if self.priority_label.is_empty() {
             String::new()
         } else {
             format!("  [{}]", self.priority_label)
         };
-        write!(f, "{}{}  {}", self.identifier, pri, self.title)
+        write!(f, "{}{}{}  {}", self.identifier, state, pri, self.title)
     }
 }
 
@@ -400,6 +407,7 @@ pub fn fetch_team_issues(
                     priorityLabel
                     state { name type }
                     assignee { id name }
+                    updatedAt
                 }
             }
             viewer { id }
@@ -423,16 +431,17 @@ pub fn fetch_team_issues(
     Ok((issues, viewer_id))
 }
 
-/// Sort issues by: priority (urgent first, no-priority last), then started before backlog, then by identifier.
+/// Sort issues by: status (in progress → todo → backlog), then priority (urgent first,
+/// no-priority last), then most recently updated first.
 fn sort_issues(issues: &mut [IssueSummary]) {
     issues.sort_by(|a, b| {
-        // Priority: 1=urgent, 2=high, 3=medium, 4=low, 0=no priority
-        // Map 0 to 5 so no-priority sorts last
+        // Priority: 1=urgent, 2=high, 3=medium, 4=low, 0=no priority. Map 0 to 5 so it sorts last.
         let pa = if a.priority == 0 { 5 } else { a.priority };
         let pb = if b.priority == 0 { 5 } else { b.priority };
-        pa.cmp(&pb)
-            .then_with(|| state_order(&a.state_type).cmp(&state_order(&b.state_type)))
-            .then_with(|| a.identifier.cmp(&b.identifier))
+        state_order(&a.state_type)
+            .cmp(&state_order(&b.state_type))
+            .then_with(|| pa.cmp(&pb))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
     });
 }
 
@@ -465,6 +474,7 @@ pub fn fetch_issue_statuses(
                     priorityLabel
                     state { name type }
                     assignee { id name }
+                    updatedAt
                 }
             }
         }
