@@ -1,6 +1,8 @@
 mod claude;
 mod config;
+mod dev;
 mod git;
+mod init;
 mod linear;
 mod picker;
 mod prompt;
@@ -8,7 +10,8 @@ mod prompt;
 use std::collections::HashMap;
 use std::process;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use inquire::Select;
 
 #[derive(Parser)]
@@ -37,6 +40,12 @@ struct Cli {
     base: Option<String>,
 }
 
+#[derive(Clone, ValueEnum)]
+enum CompleteKind {
+    /// Worktree identifiers, bare numbers, and branch names
+    Worktrees,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Store your Linear personal access token
@@ -50,6 +59,42 @@ enum Commands {
     Status,
     /// Remove worktrees for completed/cancelled issues
     Clean,
+    /// Print the worktree path for an issue (use with `cd (cl cd 113)`)
+    Cd {
+        /// Issue identifier (e.g. WS-112), bare number (113), or branch name
+        issue: String,
+    },
+    /// Print shell integration script (source via e.g. `cl init fish | source`)
+    Init {
+        /// Target shell
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+    /// Internal: emit completion data for shell scripts (used by `cl init`)
+    #[command(name = "_complete", hide = true)]
+    Complete {
+        #[arg(value_enum)]
+        kind: CompleteKind,
+    },
+    /// Manage dev servers in worktrees (one per named command, runs in parallel)
+    ///
+    /// `cl dev <issue> [name]` starts (or restarts) the named slot in the issue's
+    /// worktree. Different slots (e.g. `rebus`, `hasura`) run in parallel; the
+    /// same slot started twice is restarted in the new worktree.
+    /// `cl dev` with no args prints status for every running slot.
+    /// `cl dev --stop` stops everything; `cl dev --stop <name>` stops just one.
+    Dev {
+        /// Issue identifier (e.g. WS-112) or branch name. Omit to print status.
+        issue: Option<String>,
+        /// Named command from `[dev.commands]` config. Falls back to the configured default.
+        name: Option<String>,
+        /// Stop dev servers. With no value, stops all; with a name, stops just that slot.
+        #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "SLOT")]
+        stop: Option<String>,
+        /// Run a custom shell command instead of any configured one
+        #[arg(long)]
+        cmd: Option<String>,
+    },
 }
 
 fn main() {
@@ -68,6 +113,18 @@ fn main() {
         }
         Some(Commands::Clean) => {
             run_clean();
+        }
+        Some(Commands::Cd { issue }) => {
+            run_cd(&issue);
+        }
+        Some(Commands::Init { shell }) => {
+            run_init(shell);
+        }
+        Some(Commands::Complete { kind }) => {
+            run_complete(kind);
+        }
+        Some(Commands::Dev { issue, name, stop, cmd }) => {
+            run_dev(issue, name, stop, cmd, &cfg);
         }
         None => {
             // CLI flags override config
@@ -173,6 +230,7 @@ fn run_picker(
     match result {
         picker::PickerResult::ResumeSession(wt) => {
             let name = wt.display_name();
+            sync_worktree(&wt.path, cfg);
             eprintln!("Resuming session in {}...", wt.path.display());
             claude::exec_claude_resume(name, &wt.path, cfg);
         }
@@ -258,10 +316,11 @@ fn run_start(
                     let taken = existing.iter().any(|w| w.branch == fork_branch);
                     if !taken {
                         linear::update_issue(&api_key, &issue);
-                        let path = git::create_worktree(&fork_branch).unwrap_or_else(|e| {
-                            eprintln!("Error: {e}");
-                            process::exit(1);
-                        });
+                        let path = git::create_worktree(&fork_branch, cfg.worktree_symlinks())
+                            .unwrap_or_else(|e| {
+                                eprintln!("Error: {e}");
+                                process::exit(1);
+                            });
                         eprintln!("  Forked: {}", path.display());
                         eprintln!();
                         if chrome {
@@ -275,6 +334,7 @@ fn run_start(
             } else if choice == "New session" {
                 // Fresh prompt in the first existing worktree
                 let wt = &existing[0];
+                sync_worktree(&wt.path, cfg);
                 linear::update_issue(&api_key, &issue);
                 eprintln!();
                 if chrome {
@@ -291,6 +351,7 @@ fn run_start(
                     })
                     .unwrap_or(0);
                 let wt = &existing[idx];
+                sync_worktree(&wt.path, cfg);
                 claude::exec_claude_resume(wt.display_name(), &wt.path, cfg);
             }
         }
@@ -299,10 +360,11 @@ fn run_start(
     linear::update_issue(&api_key, &issue);
 
     let worktree_path = if worktree {
-        let path = git::create_worktree(&issue.branch_name).unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
-            process::exit(1);
-        });
+        let path = git::create_worktree(&issue.branch_name, cfg.worktree_symlinks())
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
         eprintln!("  Worktree: {}", path.display());
         Some(path)
     } else if branch {
@@ -486,8 +548,182 @@ fn run_clean() {
                     eprintln!("Warning: {e}");
                 }
             }
-            Err(e) => eprintln!("Warning: Failed to remove {id}: {e}"),
+            Err(_) => {
+                let dirty = git::worktree_dirty_files(&wt.path);
+                if dirty.is_empty() {
+                    eprintln!("Warning: Failed to remove {id}");
+                    continue;
+                }
+
+                eprintln!();
+                eprintln!("⚠ {id} has uncommitted changes:");
+                for line in dirty.iter().take(10) {
+                    eprintln!("    {line}");
+                }
+                if dirty.len() > 10 {
+                    eprintln!("    … and {} more", dirty.len() - 10);
+                }
+
+                let prompt =
+                    format!("Force-remove {id} (will DISCARD these changes)?");
+                let force = inquire::Confirm::new(&prompt)
+                    .with_default(false)
+                    .prompt()
+                    .unwrap_or(false);
+
+                if !force {
+                    eprintln!("Skipped {id}");
+                    continue;
+                }
+
+                match git::force_remove_worktree(&wt.path) {
+                    Ok(()) => {
+                        eprintln!("Force-removed worktree: {id}");
+                        if let Err(e) = git::delete_branch(&wt.branch) {
+                            eprintln!("Warning: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("Error: Failed to force-remove {id}: {e}"),
+                }
+            }
         }
     }
     println!("Done.");
+}
+
+/// Run sync_worktree_symlinks against a worktree using the merged config.
+/// Silent on success — only the env-files / user-paths code prints on failure.
+fn sync_worktree(worktree_path: &std::path::Path, cfg: &config::ClConfig) {
+    let Ok(root) = git::main_repo_root() else { return };
+    git::sync_worktree_symlinks(worktree_path, &root, cfg.worktree_symlinks());
+}
+
+fn run_init(shell: Shell) {
+    print!("{}", init::render(shell));
+}
+
+fn run_complete(kind: CompleteKind) {
+    match kind {
+        CompleteKind::Worktrees => {
+            let worktrees = git::list_worktrees().unwrap_or_default();
+            // Emit identifier, bare number, and branch name as separate
+            // candidates so prefix completion finds the worktree regardless of
+            // which form the user typed.
+            for w in worktrees {
+                if let Some(id) = &w.identifier {
+                    println!("{id}");
+                    if let Some((_, num)) = id.rsplit_once('-') {
+                        println!("{num}");
+                    }
+                }
+                println!("{}", w.branch);
+            }
+        }
+    }
+}
+
+fn run_cd(issue: &str) {
+    let worktrees = git::list_worktrees().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    match worktrees.into_iter().find(|w| w.matches(issue)) {
+        Some(w) => println!("{}", w.path.display()),
+        None => {
+            eprintln!("Error: No worktree found for '{issue}'.");
+            process::exit(1);
+        }
+    }
+}
+
+fn run_dev(
+    issue: Option<String>,
+    name: Option<String>,
+    stop: Option<String>,
+    cmd: Option<String>,
+    cfg: &config::ClConfig,
+) {
+    if let Some(target) = stop {
+        if target.is_empty() {
+            let n = dev::kill_all();
+            if n == 0 {
+                println!("No dev servers were running.");
+            } else {
+                println!("Stopped {n} dev server{}.", if n == 1 { "" } else { "s" });
+            }
+        } else if dev::kill_slot(&target) {
+            println!("Stopped '{target}'.");
+        } else {
+            println!("No dev server named '{target}' was running.");
+        }
+        return;
+    }
+
+    let Some(issue) = issue else {
+        dev::print_status();
+        return;
+    };
+
+    // Resolve the worktree for this issue/branch
+    let worktrees = git::list_worktrees().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    let wt = match worktrees.into_iter().find(|w| w.matches(&issue)) {
+        Some(w) => w,
+        None => {
+            eprintln!("Error: No worktree found for '{issue}'.");
+            eprintln!("Run `cl status` to see active worktrees, or `cl <issue>` to create one.");
+            process::exit(1);
+        }
+    };
+
+    // Resolve the slot name and command. The slot identifies which "service"
+    // this is (rebus, hasura, retail) — different slots run in parallel; the
+    // same slot started again is restarted in the new worktree.
+    let (slot, command) = if let Some(c) = cmd {
+        let slot = name.unwrap_or_else(|| "_adhoc".to_string());
+        (slot, c)
+    } else {
+        let resolved = name.or_else(|| cfg.dev_default_name().map(String::from));
+        let Some(slot) = resolved else {
+            eprintln!("Error: No dev command name given and no default configured.");
+            let names = cfg.dev_command_names();
+            if names.is_empty() {
+                eprintln!();
+                eprintln!("Add commands to ~/.config/cl/projects/<repo>/config.toml:");
+                eprintln!();
+                eprintln!("  [dev]");
+                eprintln!("  default = \"app\"");
+                eprintln!();
+                eprintln!("  [dev.commands]");
+                eprintln!("  app = \"yarn dev\"");
+            } else {
+                eprintln!("  Available commands: {}", names.join(", "));
+                eprintln!("  Try: cl dev {issue} <name>");
+            }
+            process::exit(1);
+        };
+        match cfg.dev_command(Some(&slot)) {
+            Some(c) => (slot, c),
+            None => {
+                let names = cfg.dev_command_names();
+                eprintln!("Error: No command named '{slot}'.");
+                if !names.is_empty() {
+                    eprintln!("  Available: {}", names.join(", "));
+                }
+                process::exit(1);
+            }
+        }
+    };
+
+    // Restart only this slot — leave other running slots (e.g. hasura) alone.
+    dev::kill_slot(&slot);
+
+    if let Err(e) = dev::spawn_foreground(&slot, &wt.path, &command) {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    }
 }

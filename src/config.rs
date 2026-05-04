@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -10,6 +11,24 @@ use serde::{Deserialize, Serialize};
 pub struct ClConfig {
     pub workspace: Option<WorkspaceConfig>,
     pub claude: Option<ClaudeConfig>,
+    pub dev: Option<DevConfig>,
+    pub worktree: Option<WorktreeConfig>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct DevConfig {
+    /// Name of the default command to run when none is specified
+    pub default: Option<String>,
+    /// Named dev commands keyed by short name (e.g. "rebus" → "yarn turbo run dev --filter=...")
+    pub commands: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct WorktreeConfig {
+    /// Paths (relative to main repo root) to symlink into every worktree.
+    /// Use for personal, globally-gitignored scratch dirs like `.notes` that
+    /// should be shared across worktrees rather than duplicated.
+    pub symlinks: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -44,7 +63,61 @@ impl ClConfig {
             }),
             (a, b) => b.or(a),
         };
-        ClConfig { workspace, claude }
+        let dev = match (self.dev, other.dev) {
+            (Some(a), Some(b)) => {
+                let commands = match (a.commands, b.commands) {
+                    (Some(mut a_cmds), Some(b_cmds)) => {
+                        a_cmds.extend(b_cmds);
+                        Some(a_cmds)
+                    }
+                    (a, b) => b.or(a),
+                };
+                Some(DevConfig {
+                    default: b.default.or(a.default),
+                    commands,
+                })
+            }
+            (a, b) => b.or(a),
+        };
+        // Symlink lists union across layers — a project can extend the global
+        // list rather than replacing it.
+        let worktree = match (self.worktree, other.worktree) {
+            (Some(a), Some(b)) => {
+                let symlinks = match (a.symlinks, b.symlinks) {
+                    (Some(mut a_links), Some(b_links)) => {
+                        for link in b_links {
+                            if !a_links.contains(&link) {
+                                a_links.push(link);
+                            }
+                        }
+                        Some(a_links)
+                    }
+                    (a, b) => b.or(a),
+                };
+                Some(WorktreeConfig { symlinks })
+            }
+            (a, b) => b.or(a),
+        };
+        ClConfig { workspace, claude, dev, worktree }
+    }
+
+    pub fn dev_command(&self, name: Option<&str>) -> Option<String> {
+        let dev = self.dev.as_ref()?;
+        let commands = dev.commands.as_ref()?;
+        let key = name.or(dev.default.as_deref())?;
+        commands.get(key).cloned()
+    }
+
+    pub fn dev_default_name(&self) -> Option<&str> {
+        self.dev.as_ref()?.default.as_deref()
+    }
+
+    pub fn dev_command_names(&self) -> Vec<String> {
+        self.dev
+            .as_ref()
+            .and_then(|d| d.commands.as_ref())
+            .map(|c| c.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn team(&self) -> Option<&str> {
@@ -70,6 +143,13 @@ impl ClConfig {
             .as_ref()
             .and_then(|c| c.mode.as_deref())
             .unwrap_or("worktree")
+    }
+
+    pub fn worktree_symlinks(&self) -> &[String] {
+        self.worktree
+            .as_ref()
+            .and_then(|w| w.symlinks.as_deref())
+            .unwrap_or(&[])
     }
 }
 
@@ -100,19 +180,17 @@ fn load_local_project_config() -> ClConfig {
 
 /// User-local project config path: ~/.config/cl/projects/<path-hash>/config.toml
 /// This avoids polluting the repo with config files.
+///
+/// Uses the **main worktree** root so the same config is shared across all
+/// linked worktrees of the same repository (resolved via `git rev-parse
+/// --git-common-dir`, falling back to `--show-toplevel` outside a repo).
 fn local_project_config_path() -> PathBuf {
-    let root = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        });
+    let root = main_repo_root().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    });
 
     // Use the path itself as directory name (replace / with -)
     let safe_name = root.replace('/', "-");
@@ -120,6 +198,23 @@ fn local_project_config_path() -> PathBuf {
         .join("projects")
         .join(safe_name)
         .join("config.toml")
+}
+
+/// Resolve the main worktree's repo root. From a linked worktree this returns
+/// the main worktree path, not the linked one — so per-project config is shared.
+pub fn main_repo_root() -> Option<String> {
+    let common_dir = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+
+    let common_path = PathBuf::from(&common_dir);
+    let abs = common_path.canonicalize().ok()?;
+    // .git → repo root is parent
+    let root = abs.parent()?.to_path_buf();
+    Some(root.to_string_lossy().to_string())
 }
 
 fn load_config_file(path: &Path) -> ClConfig {

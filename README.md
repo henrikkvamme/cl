@@ -43,3 +43,22 @@ cl <linear-issue-url> -c           # Enable Chrome integration for visual verifi
 | `-b` | Create a new git branch instead of a worktree |
 | `--raw` | No worktree or branch — use the current working tree |
 | `-c` | Enable Chrome for visual change verification and screenshots |
+
+### Worktree symlinks
+
+Personal, globally-gitignored scratch directories (e.g. `.notes/`) can be
+symlinked into every worktree so they're shared instead of duplicated.
+
+In `~/.config/cl/config.toml`:
+
+```toml
+[worktree]
+symlinks = [".notes"]
+```
+
+Paths are resolved against the **main worktree's** repo root. Symlinks are
+created when `cl <issue>` makes a new worktree and refreshed every time you
+resume into one — so adding a new entry takes effect the next time you open
+each worktree, no separate sync step needed.
+
+`.env.local` files are always symlinked automatically — no config needed.
