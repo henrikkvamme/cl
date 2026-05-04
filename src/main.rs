@@ -316,11 +316,15 @@ fn run_start(
                     let taken = existing.iter().any(|w| w.branch == fork_branch);
                     if !taken {
                         linear::update_issue(&api_key, &issue);
-                        let path = git::create_worktree(&fork_branch, cfg.worktree_symlinks())
-                            .unwrap_or_else(|e| {
-                                eprintln!("Error: {e}");
-                                process::exit(1);
-                            });
+                        let path = git::create_worktree(
+                            &fork_branch,
+                            cfg.worktree_symlinks(),
+                            cfg.worktree_setup(),
+                        )
+                        .unwrap_or_else(|e| {
+                            eprintln!("Error: {e}");
+                            process::exit(1);
+                        });
                         eprintln!("  Forked: {}", path.display());
                         eprintln!();
                         if chrome {
@@ -360,11 +364,15 @@ fn run_start(
     linear::update_issue(&api_key, &issue);
 
     let worktree_path = if worktree {
-        let path = git::create_worktree(&issue.branch_name, cfg.worktree_symlinks())
-            .unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                process::exit(1);
-            });
+        let path = git::create_worktree(
+            &issue.branch_name,
+            cfg.worktree_symlinks(),
+            cfg.worktree_setup(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        });
         eprintln!("  Worktree: {}", path.display());
         Some(path)
     } else if branch {

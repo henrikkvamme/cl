@@ -153,7 +153,11 @@ pub fn repo_root() -> Result<PathBuf, String> {
     ))
 }
 
-pub fn create_worktree(branch: &str, user_symlinks: &[String]) -> Result<PathBuf, String> {
+pub fn create_worktree(
+    branch: &str,
+    user_symlinks: &[String],
+    setup: Option<&str>,
+) -> Result<PathBuf, String> {
     let root = main_repo_root()?;
     let worktree_dir = root.parent().unwrap_or(&root).join(".cl-worktrees");
     std::fs::create_dir_all(&worktree_dir)
@@ -202,7 +206,32 @@ pub fn create_worktree(branch: &str, user_symlinks: &[String]) -> Result<PathBuf
 
     sync_worktree_symlinks(&worktree_path, &root, user_symlinks);
 
+    if let Some(cmd) = setup {
+        run_setup(&worktree_path, cmd)?;
+    }
+
     Ok(worktree_path)
+}
+
+/// Run a one-time setup command (e.g. `yarn install`) inside a freshly created
+/// worktree. Streams stdout/stderr so the user sees progress; fails the whole
+/// `create_worktree` call if the command exits non-zero, since downstream tools
+/// (dev servers, claude) will likely break without dependencies installed.
+fn run_setup(worktree_path: &Path, cmd: &str) -> Result<(), String> {
+    eprintln!("  Setup: {cmd}");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(worktree_path)
+        .status()
+        .map_err(|e| format!("Failed to run setup command: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "Worktree setup command failed (exit {}): {cmd}",
+            status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into())
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the main worktree's repo root, even when called from a linked worktree.

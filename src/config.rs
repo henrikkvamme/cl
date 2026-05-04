@@ -29,6 +29,9 @@ pub struct WorktreeConfig {
     /// Use for personal, globally-gitignored scratch dirs like `.notes` that
     /// should be shared across worktrees rather than duplicated.
     pub symlinks: Option<Vec<String>>,
+    /// Shell command to run inside a freshly created worktree (e.g. `yarn install`).
+    /// Runs once on creation, after symlinks are synced. Skipped on reuse.
+    pub setup: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -94,7 +97,10 @@ impl ClConfig {
                     }
                     (a, b) => b.or(a),
                 };
-                Some(WorktreeConfig { symlinks })
+                Some(WorktreeConfig {
+                    symlinks,
+                    setup: b.setup.or(a.setup),
+                })
             }
             (a, b) => b.or(a),
         };
@@ -150,6 +156,10 @@ impl ClConfig {
             .as_ref()
             .and_then(|w| w.symlinks.as_deref())
             .unwrap_or(&[])
+    }
+
+    pub fn worktree_setup(&self) -> Option<&str> {
+        self.worktree.as_ref().and_then(|w| w.setup.as_deref())
     }
 }
 
