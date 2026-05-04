@@ -1,12 +1,18 @@
-use std::fs;
-use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{self, Command};
+mod claude;
+mod config;
+mod dev;
+mod git;
+mod init;
+mod linear;
+mod picker;
+mod prompt;
 
-use clap::{Parser, Subcommand};
-use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::process;
 
-// --- CLI ---
+use clap::{Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
+use inquire::Select;
 
 #[derive(Parser)]
 #[command(name = "cl", about = "Bridge Linear issues to Claude Code")]
@@ -14,8 +20,8 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Linear issue URL (e.g. https://linear.app/org/issue/KL-35/slug)
-    issue_link: Option<String>,
+    /// Linear issue: URL, identifier (KL-35), or number (35)
+    issue: Option<String>,
 
     /// Create a new git branch instead of a worktree
     #[arg(short = 'b')]
@@ -28,6 +34,16 @@ struct Cli {
     /// Enable Chrome integration
     #[arg(short = 'c')]
     chrome: bool,
+
+    /// Base branch for rebasing (default: auto-detect)
+    #[arg(long)]
+    base: Option<String>,
+}
+
+#[derive(Clone, ValueEnum)]
+enum CompleteKind {
+    /// Worktree identifiers, bare numbers, and branch names
+    Worktrees,
 }
 
 #[derive(Subcommand)]
@@ -37,550 +53,677 @@ enum Commands {
         /// Linear API key
         api_key: String,
     },
+    /// Print current merged configuration
+    Config,
+    /// Show active sessions with Linear status
+    Status,
+    /// Remove worktrees for completed/cancelled issues
+    Clean,
+    /// Print the worktree path for an issue (use with `cd (cl cd 113)`)
+    Cd {
+        /// Issue identifier (e.g. WS-112), bare number (113), or branch name
+        issue: String,
+    },
+    /// Print shell integration script (source via e.g. `cl init fish | source`)
+    Init {
+        /// Target shell
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+    /// Internal: emit completion data for shell scripts (used by `cl init`)
+    #[command(name = "_complete", hide = true)]
+    Complete {
+        #[arg(value_enum)]
+        kind: CompleteKind,
+    },
+    /// Manage dev servers in worktrees (one per named command, runs in parallel)
+    ///
+    /// `cl dev <issue> [name]` starts (or restarts) the named slot in the issue's
+    /// worktree. Different slots (e.g. `rebus`, `hasura`) run in parallel; the
+    /// same slot started twice is restarted in the new worktree.
+    /// `cl dev` with no args prints status for every running slot.
+    /// `cl dev --stop` stops everything; `cl dev --stop <name>` stops just one.
+    Dev {
+        /// Issue identifier (e.g. WS-112) or branch name. Omit to print status.
+        issue: Option<String>,
+        /// Named command from `[dev.commands]` config. Falls back to the configured default.
+        name: Option<String>,
+        /// Stop dev servers. With no value, stops all; with a name, stops just that slot.
+        #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "SLOT")]
+        stop: Option<String>,
+        /// Run a custom shell command instead of any configured one
+        #[arg(long)]
+        cmd: Option<String>,
+    },
 }
-
-// --- Token Storage ---
-
-fn config_dir() -> PathBuf {
-    let dir = home_dir().join(".config").join("cl");
-    fs::create_dir_all(&dir).ok();
-    dir
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .expect("HOME not set")
-}
-
-fn save_token(key: &str) {
-    let path = config_dir().join("linear_token");
-    fs::write(&path, key.trim()).unwrap_or_else(|e| {
-        eprintln!("Error writing token to {}: {e}", path.display());
-        process::exit(1);
-    });
-    println!("Token saved to {}", path.display());
-}
-
-fn load_token() -> String {
-    if let Ok(token) = fs::read_to_string(config_dir().join("linear_token")) {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            return token;
-        }
-    }
-    if let Ok(token) = std::env::var("LINEAR_API_KEY") {
-        return token;
-    }
-    eprintln!("Error: No Linear API key found. Run `cl login <key>` or set LINEAR_API_KEY.");
-    process::exit(1);
-}
-
-// --- Linear API ---
-
-fn graphql(api_key: &str, query: &str, variables: Value) -> Result<Value, String> {
-    let client = reqwest::blocking::Client::new();
-    let resp = client
-        .post("https://api.linear.app/graphql")
-        .header("Authorization", api_key)
-        .json(&json!({ "query": query, "variables": variables }))
-        .send()
-        .map_err(|e| format!("HTTP error: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("API error: {e}"))?;
-    let body: Value = resp.json().map_err(|e| format!("JSON parse error: {e}"))?;
-    if let Some(errors) = body.get("errors") {
-        return Err(format!("GraphQL errors: {errors}"));
-    }
-    body.get("data")
-        .cloned()
-        .ok_or_else(|| "No data in response".to_string())
-}
-
-struct IssueData {
-    id: String,
-    identifier: String,
-    title: String,
-    branch_name: String,
-    assignee_id: Option<String>,
-    state_type: String,
-    started_state_id: Option<String>,
-    review_state_id: Option<String>,
-    viewer_id: String,
-    /// Rich prompt with all issue context (XML-structured)
-    prompt: String,
-}
-
-fn fetch_issue(api_key: &str, identifier: &str) -> Result<IssueData, String> {
-    let (team_key, number) = parse_team_and_number(identifier)?;
-
-    let query = r#"
-        query($teamKey: String!, $number: Float!) {
-            issues(filter: { team: { key: { eq: $teamKey } }, number: { eq: $number } }) {
-                nodes {
-                    id
-                    identifier
-                    title
-                    description
-                    branchName
-                    priority
-                    priorityLabel
-                    estimate
-                    dueDate
-                    assignee { id name }
-                    state { id name type }
-                    team {
-                        id
-                        name
-                        states { nodes { id name type } }
-                    }
-                    labels { nodes { name } }
-                    parent {
-                        identifier
-                        title
-                    }
-                    children { nodes { identifier title state { name } } }
-                    relations {
-                        nodes {
-                            type
-                            relatedIssue { identifier title }
-                        }
-                    }
-                    comments {
-                        nodes {
-                            body
-                            user { name }
-                            createdAt
-                        }
-                    }
-                    attachments {
-                        nodes {
-                            title
-                            url
-                            metadata
-                        }
-                    }
-                }
-            }
-            viewer { id }
-        }
-    "#;
-    let data = graphql(
-        api_key,
-        query,
-        json!({ "teamKey": team_key, "number": number }),
-    )?;
-
-    let issue = data["issues"]["nodes"]
-        .as_array()
-        .and_then(|a| a.first())
-        .ok_or_else(|| format!("Issue {identifier} not found"))?;
-
-    let viewer_id = data["viewer"]["id"]
-        .as_str()
-        .ok_or("Could not get viewer ID")?
-        .to_string();
-
-    let states = issue["team"]["states"]["nodes"]
-        .as_array()
-        .ok_or("Could not get team states")?;
-    let find_state = |substring: &str| {
-        states
-            .iter()
-            .find(|s| {
-                s["name"]
-                    .as_str()
-                    .is_some_and(|n| n.to_lowercase().contains(substring))
-            })
-            .and_then(|s| s["id"].as_str())
-            .map(String::from)
-    };
-    let started_state_id = find_state("progress");
-    let review_state_id = find_state("review");
-
-    let ident = str_field(issue, "identifier")?;
-    let title = str_field(issue, "title")?;
-    let branch_name = str_field(issue, "branchName")?;
-    let prompt = build_issue_prompt(issue, &ident, &branch_name);
-
-    Ok(IssueData {
-        id: str_field(issue, "id")?,
-        identifier: ident,
-        title,
-        branch_name,
-        assignee_id: issue["assignee"]["id"].as_str().map(String::from),
-        state_type: issue["state"]["type"].as_str().unwrap_or("").to_string(),
-        started_state_id,
-        review_state_id,
-        viewer_id,
-        prompt,
-    })
-}
-
-fn build_issue_prompt(issue: &Value, identifier: &str, branch_name: &str) -> String {
-    let mut p = format!("# Linear Issue {identifier}\n\n");
-
-    let title = issue["title"].as_str().unwrap_or("");
-    p.push_str(&format!("**Title:** {title}\n\n"));
-
-    p.push_str(&format!("**Branch:** `{branch_name}`\n\n"));
-
-    // Metadata
-    let mut meta = Vec::new();
-    if let Some(team) = issue["team"]["name"].as_str() {
-        meta.push(format!("**Team:** {team}"));
-    }
-    if let Some(state) = issue["state"]["name"].as_str() {
-        meta.push(format!("**Status:** {state}"));
-    }
-    if let Some(pri) = issue["priorityLabel"].as_str() {
-        meta.push(format!("**Priority:** {pri}"));
-    }
-    if let Some(due) = issue["dueDate"].as_str() {
-        meta.push(format!("**Due:** {due}"));
-    }
-    if let Some(est) = issue["estimate"].as_f64() {
-        meta.push(format!("**Estimate:** {est}"));
-    }
-    if let Some(name) = issue["assignee"]["name"].as_str() {
-        meta.push(format!("**Assignee:** {name}"));
-    }
-    if let Some(labels) = issue["labels"]["nodes"].as_array() {
-        let names: Vec<&str> = labels.iter().filter_map(|l| l["name"].as_str()).collect();
-        if !names.is_empty() {
-            meta.push(format!("**Labels:** {}", names.join(", ")));
-        }
-    }
-    if !meta.is_empty() {
-        p.push_str(&meta.join(" | "));
-        p.push_str("\n\n");
-    }
-
-    // Description
-    let desc = issue["description"].as_str().unwrap_or("");
-    if !desc.is_empty() {
-        p.push_str(&format!("## Description\n\n{desc}\n\n"));
-    }
-
-    // Parent issue
-    if let (Some(pid), Some(ptitle)) = (
-        issue["parent"]["identifier"].as_str(),
-        issue["parent"]["title"].as_str(),
-    ) {
-        p.push_str(&format!("## Parent Issue\n\n- **{pid}**: {ptitle}\n\n"));
-    }
-
-    // Sub-issues
-    if let Some(children) = issue["children"]["nodes"]
-        .as_array()
-        .filter(|a| !a.is_empty())
-    {
-        p.push_str("## Sub-issues\n\n");
-        for child in children {
-            let ci = child["identifier"].as_str().unwrap_or("?");
-            let ct = child["title"].as_str().unwrap_or("");
-            let cs = child["state"]["name"].as_str().unwrap_or("");
-            p.push_str(&format!("- **{ci}** [{cs}]: {ct}\n"));
-        }
-        p.push('\n');
-    }
-
-    // Relations
-    if let Some(relations) = issue["relations"]["nodes"]
-        .as_array()
-        .filter(|a| !a.is_empty())
-    {
-        p.push_str("## Related Issues\n\n");
-        for rel in relations {
-            let rtype = rel["type"].as_str().unwrap_or("related");
-            let ri = rel["relatedIssue"]["identifier"].as_str().unwrap_or("?");
-            let rt = rel["relatedIssue"]["title"].as_str().unwrap_or("");
-            p.push_str(&format!("- **{ri}** ({rtype}): {rt}\n"));
-        }
-        p.push('\n');
-    }
-
-    // Attachments
-    if let Some(attachments) = issue["attachments"]["nodes"]
-        .as_array()
-        .filter(|a| !a.is_empty())
-    {
-        p.push_str("## Attachments\n\n");
-        for att in attachments {
-            let at = att["title"].as_str().unwrap_or("Untitled");
-            let au = att["url"].as_str().unwrap_or("");
-            p.push_str(&format!("- [{at}]({au})\n"));
-        }
-        p.push('\n');
-    }
-
-    // Comments
-    if let Some(comments) = issue["comments"]["nodes"]
-        .as_array()
-        .filter(|a| !a.is_empty())
-    {
-        p.push_str("## Comments\n\n");
-        for comment in comments {
-            let user = comment["user"]["name"].as_str().unwrap_or("Unknown");
-            let date = comment["createdAt"].as_str().unwrap_or("");
-            let body = comment["body"].as_str().unwrap_or("");
-            p.push_str(&format!("**{user}** ({date}):\n{body}\n\n"));
-        }
-    }
-
-    p
-}
-
-fn str_field(obj: &Value, field: &str) -> Result<String, String> {
-    obj[field]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| format!("Missing field: {field}"))
-}
-
-fn update_issue(api_key: &str, issue: &IssueData) {
-    let mut input = json!({});
-
-    let needs_assign = issue
-        .assignee_id
-        .as_ref()
-        .is_none_or(|id| id != &issue.viewer_id);
-    if needs_assign {
-        input["assigneeId"] = json!(issue.viewer_id);
-    }
-
-    if issue.state_type != "started" && issue.started_state_id.is_some() {
-        input["stateId"] = json!(issue.started_state_id);
-    }
-
-    if input.as_object().is_none_or(|o| o.is_empty()) {
-        return;
-    }
-
-    let query = r#"
-        mutation($issueId: String!, $input: IssueUpdateInput!) {
-            issueUpdate(id: $issueId, input: $input) {
-                success
-            }
-        }
-    "#;
-
-    match graphql(
-        api_key,
-        query,
-        json!({ "issueId": issue.id, "input": input }),
-    ) {
-        Ok(_) => {
-            if needs_assign {
-                eprintln!("Assigned issue to you.");
-            }
-            if issue.state_type != "started" && issue.started_state_id.is_some() {
-                eprintln!("Moved issue to In Progress.");
-            }
-        }
-        Err(e) => eprintln!("Warning: Failed to update issue: {e}"),
-    }
-}
-
-// --- URL Parsing ---
-
-fn parse_team_and_number(identifier: &str) -> Result<(String, f64), String> {
-    let parts: Vec<&str> = identifier.splitn(2, '-').collect();
-    if parts.len() != 2 {
-        return Err(format!(
-            "Invalid identifier format: {identifier} (expected TEAM-123)"
-        ));
-    }
-    let team_key = parts[0].to_string();
-    let number: f64 = parts[1]
-        .parse()
-        .map_err(|_| format!("Invalid issue number in: {identifier}"))?;
-    Ok((team_key, number))
-}
-
-fn parse_identifier(link: &str) -> Result<String, String> {
-    let parts: Vec<&str> = link.trim_end_matches('/').split('/').collect();
-    let idx = parts
-        .iter()
-        .position(|&p| p == "issue")
-        .ok_or("URL does not contain 'issue' segment")?;
-    let ident = parts
-        .get(idx + 1)
-        .ok_or("No identifier found after 'issue' in URL")?;
-    Ok(ident.to_uppercase())
-}
-
-// --- Git ---
-
-fn ensure_clean_tree() -> Result<(), String> {
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    if !output.stdout.is_empty() {
-        return Err("Working tree is not clean. Commit or stash changes first.".into());
-    }
-    Ok(())
-}
-
-fn create_branch(name: &str) -> Result<(), String> {
-    let status = Command::new("git")
-        .args(["checkout", "-b", name])
-        .status()
-        .map_err(|e| format!("Failed to run git checkout: {e}"))?;
-    if !status.success() {
-        return Err(format!("git checkout -b {name} failed"));
-    }
-    Ok(())
-}
-
-// --- Chrome ---
-
-fn ensure_chrome_running() {
-    let check = Command::new("pgrep").args(["-x", "Google Chrome"]).output();
-    let running = check.is_ok_and(|o| o.status.success());
-    if !running {
-        eprintln!("Launching Google Chrome...");
-        let _ = Command::new("open").args(["-a", "Google Chrome"]).status();
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-}
-
-// --- Prompt ---
-
-fn build_prompt(issue: &IssueData, worktree: bool, chrome: bool) -> String {
-    let mut prompt = issue.prompt.clone();
-
-    prompt.push_str("\n\n---\n\n");
-
-    if worktree || !issue.branch_name.is_empty() {
-        prompt.push_str(&format!(
-            "You are on working branch `{}`.\n\n",
-            issue.branch_name
-        ));
-    }
-
-    if worktree {
-        prompt.push_str(
-            "You are in a git worktree. As a first step, symlink .env and .env.local \
-             from the main repository root into this worktree directory if they exist.\n\n",
-        );
-    }
-
-    prompt.push_str(
-        "Follow this workflow:\n\
-         1. Read the issue description and plan your implementation approach.\n\
-         2. Implement the changes.\n\
-         3. Run any relevant linting and formatting tools if necessary.\n\
-         4. Run `git fetch origin main && git rebase origin/main` to make sure we are up-to-date before pushing.\n\
-         5. Create a pull request and assign it to me.\n",
-    );
-
-    if let Some(ref review_id) = issue.review_state_id {
-        prompt.push_str(&format!(
-            "6. After the PR is created, use the Linear MCP server to update the issue status \
-             to \"In Review\" (state ID: {review_id}).\n",
-        ));
-    }
-
-    prompt.push_str(
-        "\nFor any Linear operations (updating issue status, etc.), use the Linear MCP server.\n",
-    );
-
-    if chrome {
-        prompt.push_str(
-            "\nFor checking: if there are any visual changes, run the application in \
-             debug/dev mode and verify that the feature works correctly in the browser.\n\
-             When creating the PR, if there are visual changes, take a screenrecording using the \
-             Chrome gif_creator tool and include it in the PR as a comment. Upload using the git_shot skill.\n\
-             IMPORTANT: If the project uses bun, use `bunx gitshot ...`, otherwise it will not work.
-             \n",
-        );
-    }
-
-    prompt
-}
-
-// --- Exec Claude ---
-
-fn exec_claude(issue: &IssueData, prompt: &str, worktree: bool, chrome: bool) -> ! {
-    let mut cmd = Command::new("claude");
-
-    cmd.arg("--allow-dangerously-skip-permissions");
-    cmd.args(["--name", &issue.identifier]);
-    cmd.args(["--permission-mode", "plan"]);
-
-    if chrome {
-        cmd.arg("--chrome");
-    }
-
-    if worktree {
-        cmd.args(["--worktree", &issue.branch_name]);
-    }
-
-    cmd.arg(prompt);
-
-    let err = cmd.exec();
-    eprintln!("Failed to exec claude: {err}");
-    process::exit(1);
-}
-
-// --- Main ---
 
 fn main() {
     let cli = Cli::parse();
+    let cfg = config::load_config();
 
     match cli.command {
         Some(Commands::Login { api_key }) => {
-            save_token(&api_key);
+            config::save_token(&api_key);
+        }
+        Some(Commands::Config) => {
+            config::print_config(&cfg);
+        }
+        Some(Commands::Status) => {
+            run_status();
+        }
+        Some(Commands::Clean) => {
+            run_clean();
+        }
+        Some(Commands::Cd { issue }) => {
+            run_cd(&issue);
+        }
+        Some(Commands::Init { shell }) => {
+            run_init(shell);
+        }
+        Some(Commands::Complete { kind }) => {
+            run_complete(kind);
+        }
+        Some(Commands::Dev { issue, name, stop, cmd }) => {
+            run_dev(issue, name, stop, cmd, &cfg);
         }
         None => {
-            let issue_link = cli.issue_link.unwrap_or_else(|| {
-                eprintln!("Usage: cl <issue-link> [-b -c] [--raw]");
-                eprintln!("       cl login <api-key>");
-                process::exit(1);
-            });
-            // Default: worktree. -b: branch (no worktree). --raw: neither.
-            let worktree = !cli.branch && !cli.raw;
-            run_start(&issue_link, cli.branch, worktree, cli.chrome);
+            // CLI flags override config
+            let mode = if cli.branch {
+                "branch"
+            } else if cli.raw {
+                "raw"
+            } else {
+                cfg.mode()
+            };
+            let worktree = mode == "worktree";
+            let branch = mode == "branch";
+            let chrome = cli.chrome || cfg.chrome();
+
+            let base_branch =
+                git::resolve_base_branch(cli.base.as_deref()).unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                });
+
+            match cli.issue {
+                Some(issue) => {
+                    run_start(&issue, branch, worktree, chrome, &base_branch, &cfg);
+                }
+                None => {
+                    run_picker(branch, worktree, chrome, &base_branch, &cfg);
+                }
+            }
         }
     }
 }
 
-fn run_start(issue_link: &str, branch: bool, worktree: bool, chrome: bool) {
-    let identifier = parse_identifier(issue_link).unwrap_or_else(|e| {
-        eprintln!("Error: {e}");
-        process::exit(1);
-    });
-
-    let api_key = load_token();
-
-    eprintln!("Fetching issue {identifier}...");
-    let issue = fetch_issue(&api_key, &identifier).unwrap_or_else(|e| {
-        eprintln!("Error: {e}");
-        process::exit(1);
-    });
-    eprintln!("Found: {} — {}", issue.identifier, issue.title);
-    eprintln!("Branch: {}", issue.branch_name);
-
-    update_issue(&api_key, &issue);
-
-    if branch {
-        ensure_clean_tree().unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
-            process::exit(1);
-        });
-        create_branch(&issue.branch_name).unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
-            process::exit(1);
-        });
-        eprintln!("Created branch: {}", issue.branch_name);
+/// Resolve team from config, or show a picker if not configured.
+fn resolve_team(cfg: &config::ClConfig, api_key: &str) -> String {
+    if let Some(team) = cfg.team() {
+        return team.to_string();
     }
+
+    eprintln!("No team configured. Fetching teams from Linear...");
+    let teams = linear::fetch_teams(api_key).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    if teams.is_empty() {
+        eprintln!("Error: No teams found in your Linear workspace.");
+        process::exit(1);
+    }
+
+    let key = if teams.len() == 1 {
+        let team = &teams[0];
+        eprintln!("Using team: {} ({})", team.key, team.name);
+        team.key.clone()
+    } else {
+        let selected = Select::new("Select team:", teams)
+            .prompt()
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+        selected.key
+    };
+
+    config::save_workspace_team(&key);
+    key
+}
+
+fn run_picker(
+    branch: bool,
+    worktree: bool,
+    chrome: bool,
+    base_branch: &str,
+    cfg: &config::ClConfig,
+) {
+    let api_key = config::load_token();
+    let team = resolve_team(cfg, &api_key);
+
+    // Fetch worktrees and issues in sequence (both need the API key context)
+    let worktrees = git::list_worktrees().unwrap_or_else(|e| {
+        eprintln!("Warning: Could not list worktrees: {e}");
+        Vec::new()
+    });
+
+    eprintln!("Fetching issues for {team}...");
+    let (issues, viewer_id) = linear::fetch_team_issues(&api_key, &team).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    // Build session titles from already-fetched issues (avoids extra API call)
+    let session_titles: HashMap<String, String> = issues
+        .iter()
+        .map(|i| (i.identifier.clone(), i.title.clone()))
+        .collect();
+
+    let result =
+        picker::show_unified_picker(worktrees, issues, &viewer_id, &session_titles)
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+
+    match result {
+        picker::PickerResult::ResumeSession(wt) => {
+            let name = wt.display_name();
+            sync_worktree(&wt.path, cfg);
+            eprintln!("Resuming session in {}...", wt.path.display());
+            claude::exec_claude_resume(name, &wt.path, cfg);
+        }
+        picker::PickerResult::StartIssue(identifier) => {
+            run_start(&identifier, branch, worktree, chrome, base_branch, cfg);
+        }
+    }
+}
+
+fn run_start(
+    issue_input: &str,
+    branch: bool,
+    worktree: bool,
+    chrome: bool,
+    base_branch: &str,
+    cfg: &config::ClConfig,
+) {
+    let api_key = config::load_token();
+
+    // Resolve team if needed (bare number input)
+    let team = if issue_input.chars().all(|c| c.is_ascii_digit()) && cfg.team().is_none() {
+        Some(resolve_team(cfg, &api_key))
+    } else {
+        cfg.team().map(String::from)
+    };
+
+    let identifier =
+        linear::resolve_identifier(issue_input, team.as_deref()).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        });
+
+    eprintln!("Fetching {identifier}...");
+    let issue = linear::fetch_issue(&api_key, &identifier).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    eprintln!();
+    eprintln!("  {} — {}", issue.identifier, issue.title);
+    eprintln!("  Branch: {}", issue.branch_name);
+
+    // Check for existing worktrees for this issue
+    if worktree {
+        let all_worktrees = git::list_worktrees().unwrap_or_default();
+        let existing: Vec<git::WorktreeInfo> = all_worktrees
+            .into_iter()
+            .filter(|w| {
+                w.identifier.as_deref() == Some(&identifier)
+                    || w.branch == issue.branch_name
+                    || w.branch.starts_with(&format!("{}-", issue.branch_name))
+            })
+            .collect();
+
+        if !existing.is_empty() {
+            let count = existing.len();
+            eprintln!(
+                "  {} existing session{}",
+                count,
+                if count > 1 { "s" } else { "" }
+            );
+            eprintln!();
+
+            // Build picker items: sessions + New + Fork
+            let mut options: Vec<String> = existing
+                .iter()
+                .map(|wt| format!("▶ {}  ({})", wt.branch, git::time_ago(wt.last_activity)))
+                .collect();
+            options.push("New session".to_string());
+            options.push("Fork session".to_string());
+
+            let choice = inquire::Select::new("Session action:", options)
+                .prompt()
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                });
+
+            if choice == "Fork session" {
+                let mut n = 2;
+                loop {
+                    let fork_branch = format!("{}-{n}", issue.branch_name);
+                    let taken = existing.iter().any(|w| w.branch == fork_branch);
+                    if !taken {
+                        linear::update_issue(&api_key, &issue);
+                        let path = git::create_worktree(&fork_branch, cfg.worktree_symlinks())
+                            .unwrap_or_else(|e| {
+                                eprintln!("Error: {e}");
+                                process::exit(1);
+                            });
+                        eprintln!("  Forked: {}", path.display());
+                        eprintln!();
+                        if chrome {
+                            claude::ensure_chrome_running();
+                        }
+                        let prompt = prompt::build_prompt(&issue, chrome, base_branch);
+                        claude::exec_claude(&issue, &prompt, Some(&path), chrome, cfg);
+                    }
+                    n += 1;
+                }
+            } else if choice == "New session" {
+                // Fresh prompt in the first existing worktree
+                let wt = &existing[0];
+                sync_worktree(&wt.path, cfg);
+                linear::update_issue(&api_key, &issue);
+                eprintln!();
+                if chrome {
+                    claude::ensure_chrome_running();
+                }
+                let prompt = prompt::build_prompt(&issue, chrome, base_branch);
+                claude::exec_claude(&issue, &prompt, Some(&wt.path), chrome, cfg);
+            } else {
+                // Selected a session — find which one
+                let idx = existing
+                    .iter()
+                    .position(|wt| {
+                        choice.contains(&wt.branch)
+                    })
+                    .unwrap_or(0);
+                let wt = &existing[idx];
+                sync_worktree(&wt.path, cfg);
+                claude::exec_claude_resume(wt.display_name(), &wt.path, cfg);
+            }
+        }
+    }
+
+    linear::update_issue(&api_key, &issue);
+
+    let worktree_path = if worktree {
+        let path = git::create_worktree(&issue.branch_name, cfg.worktree_symlinks())
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+        eprintln!("  Worktree: {}", path.display());
+        Some(path)
+    } else if branch {
+        git::ensure_clean_tree().unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        });
+        git::create_branch(&issue.branch_name).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        });
+        None
+    } else {
+        None
+    };
+    eprintln!();
 
     if chrome {
-        ensure_chrome_running();
+        claude::ensure_chrome_running();
     }
 
-    let prompt = build_prompt(&issue, worktree, chrome);
-    exec_claude(&issue, &prompt, worktree, chrome);
+    let prompt = prompt::build_prompt(&issue, chrome, base_branch);
+    claude::exec_claude(
+        &issue,
+        &prompt,
+        worktree_path.as_deref(),
+        chrome,
+        cfg,
+    );
+}
+
+fn run_status() {
+    let worktrees = git::list_worktrees().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    if worktrees.is_empty() {
+        println!("No active sessions.");
+        return;
+    }
+
+    // Fetch issue statuses from Linear
+    let api_key = config::load_token();
+    let ids: Vec<&str> = worktrees
+        .iter()
+        .filter_map(|w| w.identifier.as_deref())
+        .collect();
+
+    let statuses: HashMap<String, linear::IssueSummary> =
+        if !ids.is_empty() {
+            linear::fetch_issue_statuses(&api_key, &ids)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| (s.identifier.clone(), s))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+    // Check for PRs via gh
+    let pr_urls: HashMap<String, String> = worktrees
+        .iter()
+        .filter_map(|w| {
+            let url = git::gh_pr_field(&w.branch, "url")?;
+            Some((w.branch.clone(), url))
+        })
+        .collect();
+
+    println!("Active Sessions");
+    println!("{}", "─".repeat(60));
+    for wt in &worktrees {
+        let id = wt.display_name();
+        let ago = git::time_ago(wt.last_activity);
+
+        let (status, title) = statuses
+            .get(id)
+            .map(|s| (s.state_name.as_str(), s.title.as_str()))
+            .unwrap_or(("", ""));
+
+        let pr = pr_urls
+            .get(&wt.branch)
+            .map(|u| format!("  {u}"))
+            .unwrap_or_default();
+
+        println!("{id}  {status}  {title}  ({ago}){pr}");
+    }
+}
+
+fn run_clean() {
+    let worktrees = git::list_worktrees().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    if worktrees.is_empty() {
+        println!("No worktrees to clean.");
+        return;
+    }
+
+    let api_key = config::load_token();
+    let ids: Vec<&str> = worktrees
+        .iter()
+        .filter_map(|w| w.identifier.as_deref())
+        .collect();
+
+    // Fetch statuses to find completed/cancelled issues
+    let statuses: HashMap<String, linear::IssueSummary> = if !ids.is_empty() {
+        linear::fetch_issue_statuses(&api_key, &ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.identifier.clone(), s))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    // Check which branches have merged PRs
+    let merged_branches: Vec<String> = worktrees
+        .iter()
+        .filter(|w| {
+            git::gh_pr_field(&w.branch, "state")
+                .is_some_and(|s| s == "MERGED")
+        })
+        .map(|w| w.branch.clone())
+        .collect();
+
+    let stale: Vec<&git::WorktreeInfo> = worktrees
+        .iter()
+        .filter(|w| {
+            let is_done = w
+                .identifier
+                .as_ref()
+                .and_then(|id| statuses.get(id))
+                .is_some_and(|s| {
+                    matches!(s.state_type.as_str(), "completed" | "cancelled")
+                });
+            let is_merged = merged_branches.contains(&w.branch);
+            is_done || is_merged
+        })
+        .collect();
+
+    if stale.is_empty() {
+        println!("No stale worktrees to clean.");
+        return;
+    }
+
+    println!("Stale worktrees:");
+    for wt in &stale {
+        let id = wt.display_name();
+        let status = wt
+            .identifier
+            .as_ref()
+            .and_then(|i| statuses.get(i))
+            .map(|s| s.state_name.as_str())
+            .unwrap_or("");
+        let merged = if merged_branches.contains(&wt.branch) {
+            " (PR merged)"
+        } else {
+            ""
+        };
+        println!("  {id}  {status}{merged}  {}", wt.path.display());
+    }
+
+    let confirm = inquire::Confirm::new("Remove these worktrees?")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false);
+
+    if !confirm {
+        println!("Aborted.");
+        return;
+    }
+
+    for wt in &stale {
+        let id = wt.display_name();
+        match git::remove_worktree(&wt.path) {
+            Ok(()) => {
+                eprintln!("Removed worktree: {id}");
+                if let Err(e) = git::delete_branch(&wt.branch) {
+                    eprintln!("Warning: {e}");
+                }
+            }
+            Err(_) => {
+                let dirty = git::worktree_dirty_files(&wt.path);
+                if dirty.is_empty() {
+                    eprintln!("Warning: Failed to remove {id}");
+                    continue;
+                }
+
+                eprintln!();
+                eprintln!("⚠ {id} has uncommitted changes:");
+                for line in dirty.iter().take(10) {
+                    eprintln!("    {line}");
+                }
+                if dirty.len() > 10 {
+                    eprintln!("    … and {} more", dirty.len() - 10);
+                }
+
+                let prompt =
+                    format!("Force-remove {id} (will DISCARD these changes)?");
+                let force = inquire::Confirm::new(&prompt)
+                    .with_default(false)
+                    .prompt()
+                    .unwrap_or(false);
+
+                if !force {
+                    eprintln!("Skipped {id}");
+                    continue;
+                }
+
+                match git::force_remove_worktree(&wt.path) {
+                    Ok(()) => {
+                        eprintln!("Force-removed worktree: {id}");
+                        if let Err(e) = git::delete_branch(&wt.branch) {
+                            eprintln!("Warning: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("Error: Failed to force-remove {id}: {e}"),
+                }
+            }
+        }
+    }
+    println!("Done.");
+}
+
+/// Run sync_worktree_symlinks against a worktree using the merged config.
+/// Silent on success — only the env-files / user-paths code prints on failure.
+fn sync_worktree(worktree_path: &std::path::Path, cfg: &config::ClConfig) {
+    let Ok(root) = git::main_repo_root() else { return };
+    git::sync_worktree_symlinks(worktree_path, &root, cfg.worktree_symlinks());
+}
+
+fn run_init(shell: Shell) {
+    print!("{}", init::render(shell));
+}
+
+fn run_complete(kind: CompleteKind) {
+    match kind {
+        CompleteKind::Worktrees => {
+            let worktrees = git::list_worktrees().unwrap_or_default();
+            // Emit identifier, bare number, and branch name as separate
+            // candidates so prefix completion finds the worktree regardless of
+            // which form the user typed.
+            for w in worktrees {
+                if let Some(id) = &w.identifier {
+                    println!("{id}");
+                    if let Some((_, num)) = id.rsplit_once('-') {
+                        println!("{num}");
+                    }
+                }
+                println!("{}", w.branch);
+            }
+        }
+    }
+}
+
+fn run_cd(issue: &str) {
+    let worktrees = git::list_worktrees().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    match worktrees.into_iter().find(|w| w.matches(issue)) {
+        Some(w) => println!("{}", w.path.display()),
+        None => {
+            eprintln!("Error: No worktree found for '{issue}'.");
+            process::exit(1);
+        }
+    }
+}
+
+fn run_dev(
+    issue: Option<String>,
+    name: Option<String>,
+    stop: Option<String>,
+    cmd: Option<String>,
+    cfg: &config::ClConfig,
+) {
+    if let Some(target) = stop {
+        if target.is_empty() {
+            let n = dev::kill_all();
+            if n == 0 {
+                println!("No dev servers were running.");
+            } else {
+                println!("Stopped {n} dev server{}.", if n == 1 { "" } else { "s" });
+            }
+        } else if dev::kill_slot(&target) {
+            println!("Stopped '{target}'.");
+        } else {
+            println!("No dev server named '{target}' was running.");
+        }
+        return;
+    }
+
+    let Some(issue) = issue else {
+        dev::print_status();
+        return;
+    };
+
+    // Resolve the worktree for this issue/branch
+    let worktrees = git::list_worktrees().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+
+    let wt = match worktrees.into_iter().find(|w| w.matches(&issue)) {
+        Some(w) => w,
+        None => {
+            eprintln!("Error: No worktree found for '{issue}'.");
+            eprintln!("Run `cl status` to see active worktrees, or `cl <issue>` to create one.");
+            process::exit(1);
+        }
+    };
+
+    // Resolve the slot name and command. The slot identifies which "service"
+    // this is (rebus, hasura, retail) — different slots run in parallel; the
+    // same slot started again is restarted in the new worktree.
+    let (slot, command) = if let Some(c) = cmd {
+        let slot = name.unwrap_or_else(|| "_adhoc".to_string());
+        (slot, c)
+    } else {
+        let resolved = name.or_else(|| cfg.dev_default_name().map(String::from));
+        let Some(slot) = resolved else {
+            eprintln!("Error: No dev command name given and no default configured.");
+            let names = cfg.dev_command_names();
+            if names.is_empty() {
+                eprintln!();
+                eprintln!("Add commands to ~/.config/cl/projects/<repo>/config.toml:");
+                eprintln!();
+                eprintln!("  [dev]");
+                eprintln!("  default = \"app\"");
+                eprintln!();
+                eprintln!("  [dev.commands]");
+                eprintln!("  app = \"yarn dev\"");
+            } else {
+                eprintln!("  Available commands: {}", names.join(", "));
+                eprintln!("  Try: cl dev {issue} <name>");
+            }
+            process::exit(1);
+        };
+        match cfg.dev_command(Some(&slot)) {
+            Some(c) => (slot, c),
+            None => {
+                let names = cfg.dev_command_names();
+                eprintln!("Error: No command named '{slot}'.");
+                if !names.is_empty() {
+                    eprintln!("  Available: {}", names.join(", "));
+                }
+                process::exit(1);
+            }
+        }
+    };
+
+    // Restart only this slot — leave other running slots (e.g. hasura) alone.
+    dev::kill_slot(&slot);
+
+    if let Err(e) = dev::spawn_foreground(&slot, &wt.path, &command) {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    }
 }
